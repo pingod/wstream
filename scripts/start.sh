@@ -76,14 +76,24 @@ XEOF
     sway --unsupported-gpu > "$ROOT/sway.log" 2>&1 &
   echo $! > "$ROOT/sway.pid"
 
-  # sway 的 socket 名不一定是 wayland-0（多实例时会是 wayland-1），动态找
+  # sway 的 socket 名不一定是 wayland-0（多实例时会是 wayland-1），动态找。
+  # 超时给到 60 秒：容器 / 首次运行时 fontconfig 要建缓存，可能比裸机慢一个数量级
+  # （踩过：CI 里 15 秒超时刚好不够，报「sway 没起来」但其实只是慢）。
   i=0
-  while [ $i -lt 60 ]; do
+  while [ $i -lt 240 ]; do
     [ -n "$(ls "$ROOT"/run/wayland-* 2>/dev/null | head -1)" ] && break
+    # sway 提前退出就不用再等了
+    kill -0 "$(cat "$ROOT/sway.pid" 2>/dev/null)" 2>/dev/null || break
     sleep 0.25; i=$((i+1))
   done
   WL=$(basename "$(ls "$ROOT"/run/wayland-* 2>/dev/null | head -1)" 2>/dev/null)
-  [ -n "$WL" ] || die "sway 没起来，看 $ROOT/sway.log"
+  if [ -z "$WL" ]; then
+    # 把日志打到 stderr，CI / 用户都能直接看到失败原因
+    echo "──── sway.log ────" >&2
+    cat "$ROOT/sway.log" >&2 2>/dev/null
+    echo "──────────────────" >&2
+    die "sway 没起来（日志见上）"
+  fi
   echo "$WL" > "$ROOT/wl_name"
 
   # 改分辨率

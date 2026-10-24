@@ -38,19 +38,39 @@ jobs:
       - name: 冒烟测试（无头沙箱 + 抓帧）
         run: |
           set -x
+          # 预热 fontconfig 缓存：容器里首次运行要建缓存，否则 sway 启动会慢很多
+          fc-cache -f >/dev/null 2>&1 || true
+
           ./scripts/start.sh 1280x720
-          sleep 8
-          # HTTP 首页可达
+
+          # start.sh 已等到 socket 就绪，再给 wstream 一点时间连上并抓第一帧
+          for i in $(seq 1 40); do
+            curl -fsS -o /dev/null http://127.0.0.1:8765/ 2>/dev/null && break
+            sleep 0.5
+          done
           curl -fsS -o /dev/null http://127.0.0.1:8765/
+
           # MJPEG 流有数据
-          curl -fsS --max-time 5 http://127.0.0.1:8765/stream.mjpg -o /tmp/stream.bin || true
-          test -s /tmp/stream.bin && echo "MJPEG OK ($(stat -c%s /tmp/stream.bin) bytes)"
+          curl -fsS --max-time 8 http://127.0.0.1:8765/stream.mjpg -o /tmp/stream.bin || true
+          test -s /tmp/stream.bin
+          echo "MJPEG OK ($(stat -c%s /tmp/stream.bin) bytes)"
+
           # 快照模式能出图
           WL=$(cat /tmp/wstream/wl_name)
           XDG_RUNTIME_DIR=/tmp/wstream/run WAYLAND_DISPLAY="$WL" \
             ./wstream -p 8899 -s /tmp/shot.ppm
-          test -s /tmp/shot.ppm && echo "snapshot OK"
+          test -s /tmp/shot.ppm
+          echo "snapshot OK ($(stat -c%s /tmp/shot.ppm) bytes)"
+
           ./scripts/start.sh stop
+
+      - name: 失败时打印日志
+        if: failure()
+        run: |
+          echo "──── sway.log ────"
+          cat /tmp/wstream/sway.log 2>/dev/null || echo "(无)"
+          echo "──── wstream.log ────"
+          cat /tmp/wstream/wstream.log 2>/dev/null || echo "(无)"
 
       - name: 上传快照
         if: always()
