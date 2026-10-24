@@ -2,6 +2,39 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.1] - 2026-10-24
+
+安全性修复。**推荐所有 1.0.0 用户升级**——修掉了一个能被任意网页利用的注入漏洞。
+
+### 安全
+
+- **WebSocket / HTTP 端点新增来源校验**（`ws_authorize` / `hdr_get` / `host_is_loopback` /
+  `origin_trusted`）。此前握手完全不看 `Origin` 和 `Host`，实测可复现：
+  - 任意网页的 JS 能连 `ws://127.0.0.1:8765/ws`，往沙箱里点任意坐标、敲任意键
+    （实测用 `Origin: http://evil.example` 成功在沙箱终端里敲出命令）
+  - `Host` 也不校验 → 存在 DNS rebinding 路径
+
+  正因如此，文档里「只监听 127.0.0.1 所以安全」这个结论**原本并不成立**：
+  发起连接的正是用户自己的浏览器，绑定回环地址挡不住它。
+  现在的规则：
+  - `Host` 必须是 `127.0.0.1` / `localhost` / `[::1]`
+  - 带 `Origin` 时必须是 `http(s)://127.0.0.1:<port>` 等本页来源
+  - 无 `Origin`（curl / skill 里的 Python 脚本）放行——本机进程能直连本就有等价权限
+  - 不合法一律回 `403`
+
+### 修复
+
+- **`clients[]` 并发越界**：`http_thread` 在 `poll()` 前记下数组下标，回来后按下标访问，
+  中间主线程的 `push_frame()` 可能 `drop_client()` 搬移元素并 `nclients--`，
+  导致操作到错的客户端甚至越界读。改为每轮分配单调递增的 `id`，回来后按 id 反查
+  （不存在就跳过）；`client_add` / `drop_client` / 遍历统一持 `g_cl_mu`。
+- 主线程读 `nclients` 决定是否编码，原来无锁（数据竞争）→ 改走 `has_viewers()`。
+- 退出路径：先置 `g_net_stop` 让网络线程收工，再持锁关闭 fd，避免踩已释放的 fd。
+- `hdr_get` 逐行解析请求头并跳过名字后的冒号（先前会把 `: ` 带进值里）。
+
+已在 ASan + UBSan 下用「5 路 WebSocket 反复连断（RST）+ 1 路 MJPEG 流」压测，
+无 sanitizer 报告，进程存活。
+
 ## [1.0.0] - 2026-10-24
 
 首个可用版本。

@@ -273,6 +273,21 @@ Connection: Upgrade
 Sec-WebSocket-Accept: <base64>
 ```
 
+### 握手前的来源校验（1.0.1 起）
+
+标准握手**不校验来源**，而这是真实漏洞：任意网页的 JS 都能连 `ws://127.0.0.1:8765/ws`，
+往沙箱里点坐标敲键。`bind(127.0.0.1)` 挡不住——发起连接的正是用户自己的浏览器。
+
+所以 `ws_authorize()` 在回 101 之前先查两个头：
+
+```c
+Host   // 必须 127.0.0.1 / localhost / [::1]      → 挡 DNS rebinding
+Origin // 带了就必须是本页来源；不带则放行（curl/脚本）
+```
+
+不合法回 `403`。注意 `hdr_get()` 是**逐行**解析的，并且要跳过名字后的冒号——
+用 `strstr` 在整个请求里找会被 `X-Origin:` 这类头误命中，而漏跳冒号会让值变成 `: ...`。
+
 ### 帧格式
 
 客户端 → 服务端的帧**必须加掩码**（RFC 6455 规定）：
@@ -333,6 +348,28 @@ push_frame() ──► clients[] ◄── inject_*()
 ```
 
 **关键**：网络线程只 `flush()` + 置标志，roundtrip 由主线程做。
+
+### `clients[]` 的句柄：用 id，不要用下标或 fd
+
+`http_thread` 每轮先建 `pollfd[]`，`poll()` 回来再处理。**这中间主线程可能改数组**：
+`push_frame()` 失败会调 `drop_client()`，而它把末尾元素搬进被删的槽并 `nclients--`。
+
+于是「poll 前记下的下标」在 poll 回来后可能指向另一个客户端，甚至 `>= nclients` 越界读。
+拿 fd 当键也不行——fd 会被内核复用。
+
+所以 `struct client` 有单调递增的 `id`：每轮把 id 存进与 `pfd` 平行的数组，
+回来后 `client_by_id()` 反查，查不到（已被回收）就跳过。
+
+```c
+/* 必须在持 g_cl_mu 时调用 */
+static int client_by_id(unsigned long id) { ... }
+```
+
+三条纪律：
+
+1. `client_add` / `drop_client` / 遍历 `clients[]` 一律持 `g_cl_mu`
+2. 主线程判断「有没有人在看」用 `has_viewers()`，**不要裸读 `nclients`**（数据竞争）
+3. 退出时先置 `g_net_stop` 让网络线程退循环，再持锁关 fd
 
 ---
 

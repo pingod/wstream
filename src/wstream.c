@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -56,6 +57,8 @@
 static int g_verbose;
 static int g_quality = 70;
 static int g_fps = 10;
+static int g_port = 8765;   /* 用于 Origin 校验：只信任发往本端口的页面 */
+static volatile sig_atomic_t g_net_stop;   /* main 退出时通知网络线程收工 */
 
 static void logf_(const char *fmt, ...) {
     va_list ap;
@@ -508,17 +511,44 @@ static void ws_accept_key(const char *key, char *out /* >=29 */) {
 #define WS_BIN 2
 
 struct client {
-    int fd;
+    int fd;                 /* -1 = 空槽 / 已死，等回收 */
     int is_stream;
     int is_ws;
+    unsigned long id;       /* 槽位会被复用，id 单调递增永不重用 */
     uint8_t in[16384];
     size_t in_len;
 };
 
 static struct client clients[MAX_CLIENTS];
 static int nclients;
-static int g_ws_dirty;   /* WS 读到 EOF/close，需要回收 */
+static unsigned long g_client_id;   /* 只在持锁时递增 */
 static pthread_mutex_t g_cl_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* 按 id 反查槽位。-1 = 已不存在。**调用方必须持有 g_cl_mu。**
+ *
+ * 为什么要 id 而不是下标：poll() 前记下标、poll() 回来后按下标访问，
+ * 中间主线程的 push_frame() 可能 drop_client()（把末尾元素搬进被删的槽），
+ * 于是那个下标指向了另一个客户端，甚至 >= nclients 越界读。
+ * 拿 fd 也有同样的问题（fd 会被内核复用）。id 单调递增，不会和任何旧对象混淆。 */
+static int client_by_id(unsigned long id) {
+    if (!id) return -1;
+    for (int i = 0; i < nclients; i++)
+        if (clients[i].id == id) return i;
+    return -1;
+}
+
+/* 注册一个新客户端；返回 id，0 = 满了。**调用方必须持有 g_cl_mu。** */
+static unsigned long client_add(int fd, int is_stream, int is_ws) {
+    if (nclients >= MAX_CLIENTS) return 0;
+    struct client *c = &clients[nclients++];
+    memset(c, 0, sizeof *c);
+    c->fd = fd;
+    c->is_stream = is_stream;
+    c->is_ws = is_ws;
+    c->id = ++g_client_id;
+    if (!c->id) c->id = ++g_client_id;   /* 回绕保护（实际不可能） */
+    return c->id;
+}
 
 static int send_all(int fd, const void *buf, size_t len) {
     const uint8_t *p = buf;
@@ -531,11 +561,13 @@ static int send_all(int fd, const void *buf, size_t len) {
     return 0;
 }
 
+/* **调用方必须持有 g_cl_mu。** */
 static void drop_client(int i) {
     if (g_verbose) logf_("[-] 客户端断开 (stream=%d ws=%d)", clients[i].is_stream, clients[i].is_ws);
-    close(clients[i].fd);
+    if (clients[i].fd >= 0) close(clients[i].fd);
     clients[i] = clients[nclients - 1];
     nclients--;
+    if (nclients > 0) memset(&clients[nclients], 0, sizeof clients[0]);
 }
 
 static const char INDEX_HTML[] =
@@ -652,6 +684,16 @@ static void serve_index(int fd) {
     close(fd);
 }
 
+static void serve_forbidden(int fd) {
+    static const char body[] = "403 Forbidden: untrusted Origin/Host\n";
+    char hdr[192];
+    int n = snprintf(hdr, sizeof hdr,
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\n"
+        "Content-Length: %zu\r\nConnection: close\r\n\r\n", sizeof body - 1);
+    if (send_all(fd, hdr, (size_t)n) == 0) send_all(fd, body, sizeof body - 1);
+    close(fd);
+}
+
 static void serve_stream(int fd) {
     static const char hdr[] =
         "HTTP/1.1 200 OK\r\n"
@@ -676,6 +718,69 @@ static void push_frame(const uint8_t *data, size_t len) {
     pthread_mutex_unlock(&g_cl_mu);
 }
 
+/* 有没有人在看画面。主线程用它决定这一帧要不要编码 —— 必须走锁，
+ * 否则读到的是网络线程正在改的 nclients（数据竞争，UB）。 */
+static int has_viewers(void) {
+    pthread_mutex_lock(&g_cl_mu);
+    int n = nclients;
+    pthread_mutex_unlock(&g_cl_mu);
+    return n > 0;
+}
+
+
+/* ---------- 请求头工具 ---------- */
+
+/* 按行取头（大小写不敏感），value 去掉前导空格。找不到返回 -1，否则返回长度。
+ * 逐行比对而不是在整个请求里 strstr：否则 `X-Origin:` 之类也会被误命中。 */
+static int hdr_get(const char *req, const char *name, char *out, size_t cap) {
+    size_t nl = strlen(name);
+    const char *p = req;
+    while (p && *p) {
+        const char *e = strstr(p, "\r\n");
+        const char *line_end = e ? e : p + strlen(p);
+        if ((size_t)(line_end - p) > nl && !strncasecmp(p, name, nl) && p[nl] == ':') {
+            const char *v = p + nl + 1;   /* 跳过冒号，否则值里会带上 ": " */
+            while (v < line_end && (*v == ' ' || *v == '\t')) v++;
+            size_t n = 0;
+            while (v + n < line_end && n + 1 < cap) { out[n] = v[n]; n++; }
+            out[n] = 0;
+            return (int)n;
+        }
+        if (!e) break;
+        p = e + 2;
+    }
+    return -1;
+}
+
+/* Host 必须是回环地址。挡的是 DNS rebinding：攻击者把 evil.com 解析到 127.0.0.1，
+ * 浏览器就会带着 `Host: evil.com` 打到我们这儿。只绑 127.0.0.1 并不能挡这一手，
+ * 因为发起连接的正是用户自己的浏览器。 */
+static int host_is_loopback(const char *host) {
+    if (!host || !*host) return 0;
+    if (!strncasecmp(host, "127.0.0.1", 9))   return host[9] == 0 || host[9] == ':';
+    if (!strncasecmp(host, "localhost", 9))   return host[9] == 0 || host[9] == ':';
+    if (!strncasecmp(host, "[::1]", 5))       return host[5] == 0 || host[5] == ':';
+    return 0;
+}
+
+/* Origin 必须是本页自己。空 Origin = 非浏览器客户端（curl / skill 里的 Python），
+ * 放行——它本来就是本机进程，能直连就已经有等价权限了。
+ *
+ * ⚠️ 不校验 Origin 的后果（实测过）：任意网页的 JS 都能连上 ws://127.0.0.1:8765/ws，
+ * 往沙箱里点任意坐标、敲任意键 ⇒ 用户只是打开一个恶意页面，agent 沙箱就被接管了。
+ * 「只监听 127.0.0.1」挡不住这个，因为握手请求是浏览器发的。
+ * 浏览器对 WebSocket 一定带 Origin，所以这条校验对正常使用零影响。 */
+static int origin_trusted(const char *origin, int port) {
+    if (!origin || !*origin) return 1;
+    char want[64];
+    static const char *hosts[] = { "http://127.0.0.1", "http://localhost", "http://[::1]" };
+    for (size_t i = 0; i < sizeof hosts / sizeof hosts[0]; i++) {
+        snprintf(want, sizeof want, "%s:%d", hosts[i], port);
+        if (!strcasecmp(origin, want)) return 1;
+        if (!strcasecmp(origin, hosts[i])) return 1;   /* 省略默认端口的情况 */
+    }
+    return 0;
+}
 
 /* ---------- WebSocket 服务端 ---------- */
 
@@ -693,14 +798,24 @@ static int ws_wants(const char *req) {
 
 /* 从请求头里抠 Sec-WebSocket-Key（去掉前导空格） */
 static int ws_get_key(const char *req, char *out, size_t cap) {
-    const char *p = strstr(req, "Sec-WebSocket-Key:");
-    if (!p) return -1;
-    p += strlen("Sec-WebSocket-Key:");
-    while (*p == ' ') p++;
-    size_t n = 0;
-    while (p[n] && p[n] != '\r' && p[n] != '\n' && n + 1 < cap) { out[n] = p[n]; n++; }
-    out[n] = 0;
-    return (int)n;
+    return hdr_get(req, "Sec-WebSocket-Key", out, cap);
+}
+
+/* 校验来源。返回 0 = 允许；-1 = 缺 key；-2 = 来源不可信（回 403） */
+static int ws_authorize(const char *req, int port) {
+    /* 必须初始化：缺 Host 时 hdr_get 返回 -1，下面的日志要读它 */
+    char host[128] = "", origin[256] = "";
+    if (hdr_get(req, "Host", host, sizeof host) < 0 || !host_is_loopback(host)) {
+        logf_("⛔ 拒绝 WebSocket：Host 不可信（%s）", host[0] ? host : "缺失");
+        return -2;
+    }
+    if (hdr_get(req, "Origin", origin, sizeof origin) >= 0 && !origin_trusted(origin, port)) {
+        logf_("⛔ 拒绝 WebSocket：Origin 不可信（%s）", origin);
+        return -2;
+    }
+    char key[128];
+    if (ws_get_key(req, key, sizeof key) <= 0) return -1;
+    return 0;
 }
 
 static int ws_handshake(int fd, const char *req) {
@@ -811,17 +926,18 @@ static void ws_read(struct client *cl) {
  * 一次都出不了帧 —— 那个 bug 就是用这个拆分修掉的。 */
 static void *http_thread(void *arg) {
     int srv = (int)(intptr_t)arg;
-    for (;;) {
+    while (!g_net_stop) {
         struct pollfd pfd[1 + MAX_CLIENTS];
+        unsigned long ws_id[1 + MAX_CLIENTS];   /* 与 pfd 一一对应，存 id 不存下标 */
         int nfd = 0;
-        pfd[nfd].fd = srv; pfd[nfd].events = POLLIN; nfd++;
-        int ws_idx[MAX_CLIENTS];
-        int nws = 0;
+        pfd[nfd].fd = srv; pfd[nfd].events = POLLIN; ws_id[nfd] = 0; nfd++;
+
         pthread_mutex_lock(&g_cl_mu);
         for (int i = 0; i < nclients; i++) {
             if (!clients[i].is_ws) continue;
-            pfd[nfd].fd = clients[i].fd; pfd[nfd].events = POLLIN; nfd++;
-            ws_idx[nws++] = i;
+            pfd[nfd].fd = clients[i].fd; pfd[nfd].events = POLLIN;
+            ws_id[nfd] = clients[i].id;
+            nfd++;
         }
         pthread_mutex_unlock(&g_cl_mu);
 
@@ -851,45 +967,48 @@ static void *http_thread(void *arg) {
                 struct timeval stv = {2, 0};
                 setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof stv);
 
-                /* 收尾：先切阻塞发完响应再还原 */
+                /* 所有端点都先过来源校验。挡的是「用户随便开一个网页，
+                 * 那个网页就能连 127.0.0.1 操作沙箱」（DNS rebinding 同理）。 */
                 if (ws_wants(req)) {
+                    int az = ws_authorize(req, g_port);
+                    if (az != 0) { serve_forbidden(cfd); continue; }
                     if (ws_handshake(cfd, req) < 0) { close(cfd); continue; }
-                    if (nclients >= MAX_CLIENTS) { close(cfd); continue; }
-                    clients[nclients].fd = cfd;
-                    clients[nclients].is_stream = 0;
-                    clients[nclients].is_ws = 1;
-                    clients[nclients].in_len = 0;
-                    nclients++;
-                } else if (strstr(req, "/stream.mjpg")) {
-                    serve_stream(cfd);
-                    if (nclients < MAX_CLIENTS) {
-                        clients[nclients].fd = cfd;
-                        clients[nclients].is_stream = 1;
-                        clients[nclients].is_ws = 0;
-                        clients[nclients].in_len = 0;
-                        nclients++;
-                    } else {
-                        close(cfd);
-                    }
+                    pthread_mutex_lock(&g_cl_mu);
+                    unsigned long id = client_add(cfd, 0, 1);
+                    pthread_mutex_unlock(&g_cl_mu);
+                    if (!id) close(cfd);
                 } else {
-                    serve_index(cfd);   /* 内部 close */
+                    char host[128] = "", origin[256] = "";
+                    if (hdr_get(req, "Host", host, sizeof host) < 0 || !host_is_loopback(host) ||
+                        (hdr_get(req, "Origin", origin, sizeof origin) >= 0 &&
+                         !origin_trusted(origin, g_port))) {
+                        serve_forbidden(cfd);
+                        continue;
+                    }
+                    if (strstr(req, "/stream.mjpg")) {
+                        serve_stream(cfd);
+                        pthread_mutex_lock(&g_cl_mu);
+                        unsigned long id = client_add(cfd, 1, 0);
+                        pthread_mutex_unlock(&g_cl_mu);
+                        if (!id) close(cfd);
+                    } else {
+                        serve_index(cfd);   /* 内部 close */
+                    }
                 }
             }
         }
 
-        /* 2) WS 输入 */
-        for (int i = 0; i < nws; i++) {
-            int pi = 1 + i;
-            if (pfd[pi].revents & (POLLIN | POLLHUP | POLLERR)) {
-                ws_read(&clients[ws_idx[i]]);
-                g_ws_dirty = 1;
-            }
+        /* 2) WS 输入。按下标访问前先按 id 反查并确认还活着 —— 见 client_by_id 的说明。 */
+        pthread_mutex_lock(&g_cl_mu);
+        for (int i = 1; i < nfd; i++) {
+            if (!(pfd[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            int idx = client_by_id(ws_id[i]);
+            if (idx < 0) continue;              /* 已经被回收了，跳过 */
+            ws_read(&clients[idx]);
         }
-        if (g_ws_dirty) {
-            g_ws_dirty = 0;
-            for (int i = nclients - 1; i >= 0; i--)
-                if (!clients[i].is_stream && !clients[i].is_ws) drop_client(i);
-        }
+        for (int i = nclients - 1; i >= 0; i--)
+            if (!clients[i].is_stream && !clients[i].is_ws) drop_client(i);
+        pthread_mutex_unlock(&g_cl_mu);
     }
     return NULL;
 }
@@ -918,6 +1037,7 @@ int main(int argc, char **argv) {
     if (fps < 1) fps = 1;
     if (fps > 30) fps = 30;
     g_fps = fps;
+    g_port = port;
 
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
@@ -1044,7 +1164,7 @@ int main(int argc, char **argv) {
 
         if (cap.frame_failed) {
             dropped++;
-        } else if (nclients > 0) {
+        } else if (has_viewers()) {
             unsigned long jlen = jpeg_encode(&enc, fb[cur].addr, W, H);
             if (jlen > 0) push_frame(enc.buf, jlen);
         }
@@ -1073,7 +1193,13 @@ int main(int argc, char **argv) {
     }
 
     logf_("退出");
-    for (int i = 0; i < nclients; i++) close(clients[i].fd);
+    /* 网络线程还卡在 poll 里，先把它叫停再拆 clients[]，否则会踩已释放的 fd。
+     * 主线程已经不再碰 fd，所以这里持锁读完就够。 */
+    g_net_stop = 1;
+    pthread_mutex_lock(&g_cl_mu);
+    for (int i = 0; i < nclients; i++)
+        if (clients[i].fd >= 0) close(clients[i].fd);
+    pthread_mutex_unlock(&g_cl_mu);
     close(srv);
     for (int i = 0; i < 2; i++) {
         wl_buffer_destroy(fb[i].wl_buf);

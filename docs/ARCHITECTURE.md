@@ -80,16 +80,21 @@
 
 ### 决策 5：为什么沙箱用 sway 而不是 labwc
 
-**决定性因素**：`motion_absolute` 支持。
+> ⚠️ 历史说明：早期把「`motion_absolute` 支持」当作选 sway 的决定性理由。
+> **现在代码已经不用 `motion_absolute` 了**——`inject_move()` 改成相对位移累积
+> （见 `docs/PROTOCOLS.md` 第三节），因为 labwc 会静默丢弃 absolute 请求。
+> 所以下表里 absolute 那一行只解释历史，不再代表当前依赖。
 
-| | labwc | sway |
+| | labwc（实测） | sway（实测） |
 |---|---|---|
-| `motion_absolute` | ❌ 只实现相对位移 | ✅ 完整 |
-| 点击切焦点 | ❌ | ✅ |
+| `motion_absolute` | ❌ 静默丢弃 | ✅ |
+| 相对位移 `motion` | ✅ | ✅（当前实现走这条） |
+| 点击切焦点 | ⚠️ 当时测下来不行 | ✅ |
 | 光标渲染 | ❌ 截图不可见 | ✅ |
 | 窗口布局 | 需手动 | ✅ 自动平铺 |
 
-labwc 更轻量，但对虚拟指针的支持不完整，导致**鼠标完全不可用**。
+**结论**：现在真正的依赖是 `motion`（相对位移）+ 点击聚焦 + 光标渲染，不是 absolute。
+如果有人想换更轻量的合成器，值得重新实测 labwc——但别假设能直接用。
 
 ## 三、主循环详解
 
@@ -181,21 +186,34 @@ struct capture {
 
 ```c
 struct client {
-    int fd;
+    int fd;               /* -1 = 空槽 / 已死 */
+    int is_stream;        /* 是否 MJPEG 订阅者 */
     int is_ws;            /* 是否已升级为 WebSocket */
-    uint8_t in[8192];     /* 读缓冲 */
+    unsigned long id;     /* 槽位会复用，id 单调递增永不重用 */
+    uint8_t in[16384];    /* 读缓冲 */
     size_t in_len;
-    /* ... */
 };
 ```
 
-### 全局锁
+### 全局锁与句柄
 
 ```c
 static pthread_mutex_t g_cl_mu = PTHREAD_MUTEX_INITIALIZER;
 ```
 
-保护 `clients[]` 数组。主线程写（`push_frame`），网络线程读写（accept/close）。
+保护 `clients[]` / `nclients`。主线程写（`push_frame`、`has_viewers`），
+网络线程读写（accept / close / 反查）。
+
+**为什么用 `id` 而不是下标或 fd**：`http_thread` 建好 `pollfd[]` 到 `poll()` 返回之间，
+主线程的 `drop_client()` 可能搬移数组元素。下标会指错人甚至越界；fd 会被内核复用。
+id 单调递增，配合 `client_by_id()` 反查即可判定「还活着没有」。
+
+| 函数 | 职责 | 锁 |
+|---|---|---|
+| `client_add` | 分配槽位并返回 id | 必须持锁 |
+| `client_by_id` | id → 槽位下标，-1 表示已回收 | 必须持锁 |
+| `drop_client` | 关闭并压缩数组 | 必须持锁 |
+| `has_viewers` | 主线程问「有人在看吗」 | 内部加锁 |
 
 ## 五、JPEG 编码
 

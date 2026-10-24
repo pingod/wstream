@@ -39,6 +39,7 @@
 - [隔离性说明](#隔离性说明)
 - [踩过的坑](#踩过的坑)
 - [已知限制](#已知限制)
+- [安全边界](#安全边界)
 - [开发](#开发)
 - [给 AI agent 用（skill）](#给-ai-agent-用skill)
 - [文档索引](#文档索引)
@@ -121,11 +122,14 @@ sudo pacman -S --needed gcc pkgconf wayland wayland-protocols \
     libjpeg-turbo libxkbcommon wlr-protocols sway
 ```
 
-> **为什么必须用 sway 而不是 labwc？**
+> **为什么用 sway 而不是 labwc？**
 > `zwlr_virtual_pointer_v1` 的 `motion_absolute` 请求**不是所有合成器都实现**。
 > labwc 只接了 `wlr_seat_pointer_notify_motion`（相对位移），absolute 请求会被
 > **静默丢弃**——表现为「键盘能打字，但鼠标点了没反应、也切不了窗口」。
-> sway 完整实现了 absolute 定位和点击聚焦，所以沙箱用 sway。
+>
+> 因此 wstream 当前**不用 absolute**，改用相对位移累积模拟绝对定位（见
+> `docs/PROTOCOLS.md` 第三节）；选 sway 的真实理由是它的点击聚焦和光标渲染更完整。
+> 换合成器前请重新实测，别假设换个轻量的就能直接跑。
 
 ---
 
@@ -188,6 +192,9 @@ push_frame() ──写──► clients[] ◄── g_cl_mu 互斥锁
   └──── g_input_dirty 标志 ◄─────────┘
         主线程看到后做一次 roundtrip
 ```
+
+`clients[]` 用单调递增的 `id` 做句柄，不用下标也不用 fd —— 因为 `poll()` 前后数组
+可能被主线程的 `drop_client()` 搬动。详见 `docs/ARCHITECTURE.md` 的「全局锁与句柄」。
 
 **为什么输入注入不直接在网络线程里 roundtrip？**
 Wayland 事件只能由**一个**线程 dispatch。两个线程同时 dispatch 同一个 `wl_display`
@@ -430,7 +437,29 @@ exec /path/to/desktop.sh
 | **无音频** | 只传画面 | 加 PipeWire 抓音频 |
 | **单客户端体验** | 多浏览器同时看会有竞争 | 加连接管理 |
 | **无剪贴板同步** | 沙箱与宿主机剪贴板不通 | 加 `wl_data_device` 桥接 |
+| **打不了非 ASCII（中文等）** | 没有 IME，前端只做 `keyCode → evdev` 映射 | 在 WS 协议里加「正文/剪贴板直传」通道 |
 | **仅 Linux / wlroots 系** | 依赖 `wlr-screencopy` 和 `zwlr_virtual_pointer` | Hyprland 的 headless 后端受限于 aquamarine 缺软件渲染 |
+
+---
+
+## 安全边界
+
+**只监听 `127.0.0.1` 并不等于安全。** 能发起连接的不只是你自己，还有你浏览器里
+打开的任何网页。所以从 1.0.1 起，握手会校验来源：
+
+| 检查 | 规则 | 挡的是什么 |
+|---|---|---|
+| `Host` | 必须是 `127.0.0.1` / `localhost` / `[::1]` | DNS rebinding（`evil.com` 解析到 127.0.0.1） |
+| `Origin` | 带该头时必须等于 `http(s)://127.0.0.1:<port>` 等本页来源 | 恶意网页的 JS 直连 `/ws` 注入键鼠 |
+| 无 `Origin` | 放行 | curl / 脚本本来就是本机进程，能直连已有等价权限 |
+
+不合法一律回 `403`。浏览器发 WebSocket 一定带 `Origin`，所以正常使用零影响。
+
+> 这个校验是补上的，不是一开始就有的：1.0.0 实测可被 `Origin: http://evil.example`
+> 的页面连进来，在沙箱里敲命令。细节见 `CHANGELOG.md` 的 1.0.1。
+
+**仍未做的**：无鉴权 token、无 TLS。如果哪天要开放到 `127.0.0.1` 之外，
+这两项是前置条件，不是可选项。
 
 ---
 
@@ -511,7 +540,7 @@ cp skills/wstream/SKILL.md ~/.agents/skills/wstream/
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 线程模型、主循环、数据结构、设计决策 |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 按症状索引的排障手册 |
 | [docs/HANDOFF.md](docs/HANDOFF.md) | **接手必读**：现状、五个不能再踩的坑、下一步建议 |
-| [CHANGELOG.md](CHANGELOG.md) | 版本历史 + 14 个已修 bug 清单 |
+| [CHANGELOG.md](CHANGELOG.md) | 版本历史 + 已修 bug 清单（1.0.0 开发期 14 个 + 1.0.1 安全修复） |
 | [skills/wstream/SKILL.md](skills/wstream/SKILL.md) | 给 AI agent 的操作手册 |
 
 ---

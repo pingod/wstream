@@ -9,8 +9,9 @@
 
 ## 0. 一句话现状
 
-**wstream 1.0.0 已发布并可用。** 4 个提交，CI 全绿，从零 clone 能编译能跑。
-核心功能（抓帧 / 推流 / 鼠标 / 键盘）全部在真机验证通过。
+**wstream 1.0.1 已可用。** 核心功能（抓帧 / 推流 / 鼠标 / 键盘）全部在真机验证通过。
+1.0.1 修了一个**安全漏洞**：WebSocket 原先不校验 `Origin`，任意网页的 JS 都能连进来
+操作沙箱（已实测复现并修复）。
 
 ```bash
 git log --oneline
@@ -55,12 +56,15 @@ agent 在沙箱里操作，两者物理上不共享输入设备。
 | 修饰键组合 | Shift 大写、Ctrl+L、Alt+Tab、Super+方向键 | ✅ |
 | 沙箱隔离 | 向沙箱注入 500 次移动 + 点击，用户真实光标完全不动 | ✅ |
 | CI | GitHub Actions 编译 + 零警告 + 冒烟测试 | ✅ 全绿 |
+| 来源校验 | 恶意 `Origin` / `Host` 回 403，正常客户端不受影响 | ✅ |
+| 并发安全 | ASan + UBSan 下 5 路 WS 反复连断 + MJPEG 流压测 | ✅ 无报告 |
 
 ---
 
-## 3. ⚠️ 五个不能再踩的坑（最重要的一节）
+## 3. ⚠️ 七个不能再踩的坑（最重要的一节）
 
 这些是花了大量时间定位出来的，**改动相关代码前务必先读**。
+前 5 条会直接让功能失效，坑 6 是安全问题，坑 7 会随机崩溃/越界。
 
 ### 坑 1：键盘键码**绝对不能 +8**
 
@@ -127,6 +131,50 @@ hyprctl clients | grep -c "^Window"
 
 ---
 
+### 坑 6：只监听 127.0.0.1 **不等于**安全
+
+1.0.0 的 `ws_handshake` 只做 RFC6455 握手，不看 `Origin`、不看 `Host`。实测后果：
+
+```bash
+# 任意网页的 JS 都能这样连进来（Origin 随便写）
+Origin: http://evil.example  →  HTTP/1.1 101 Switching Protocols
+# 然后注入点击 + 打字，沙箱截图里真的出现了敲进去的命令
+```
+
+根因是想当然：以为「只 bind 127.0.0.1，外网连不上」就安全了。但**发起连接的
+恰恰是用户自己的浏览器**，回环绑定对它毫无阻力。另外 `Host` 不校验还留了
+DNS rebinding 的路子。
+
+现在 `ws_authorize()` 的规则（改这里务必同步 `host_is_loopback` / `origin_trusted`）：
+
+| 头 | 规则 | 挡什么 |
+|---|---|---|
+| `Host` | 必须 `127.0.0.1` / `localhost` / `[::1]` | DNS rebinding |
+| `Origin` | 带了就必须是本页来源 | 恶意网页注入键鼠 |
+| 无 `Origin` | 放行 | curl / skill 脚本是本机进程，直连本就有等价权限 |
+
+**回归测试**（改完必跑，注意 `/tmp` 在部分环境每次调用会重置，需在同一条命令里跑）：
+
+```bash
+./scripts/start.sh 1280x720
+# 期望 403
+curl -si -H "Host: 127.0.0.1:8765" -H "Origin: http://evil.example"      -H "Upgrade: websocket" -H "Connection: Upgrade"      -H "Sec-WebSocket-Key: YWJjZGVmZ2gxMjM0NTY3OA=="      -H "Sec-WebSocket-Version: 13" http://127.0.0.1:8765/ws | head -1
+# 期望 101
+curl -si -H "Host: 127.0.0.1:8765" -H "Origin: http://127.0.0.1:8765"      -H "Upgrade: websocket" -H "Connection: Upgrade"      -H "Sec-WebSocket-Key: YWJjZGVmZ2gxMjM0NTY3OA=="      -H "Sec-WebSocket-Version: 13" http://127.0.0.1:8765/ws | head -1
+```
+
+### 坑 7：`clients[]` 不能用下标跨 `poll()` 传递
+
+`http_thread` 曾经在 `poll()` 前记下 `ws_idx[]`，回来后按这个下标访问 `clients[]`。
+但中间主线程的 `push_frame()` 会调 `drop_client()`，那个函数把**末尾元素搬进被删的槽**
+并 `nclients--` —— 于是下标指向了别的客户端，甚至 `>= nclients` 越界读。
+
+现在每轮分配单调递增的 `id`，回来后 `client_by_id()` 反查，查不到就跳过。
+**用 fd 也不行**（fd 会被内核复用）。`client_add` / `drop_client` / 遍历一律持 `g_cl_mu`。
+主线程判断「有没有人在看」也必须走 `has_viewers()`，不能裸读 `nclients`。
+
+---
+
 ## 4. 已知限制 / 下一步可做的
 
 ### 明确的限制
@@ -137,15 +185,19 @@ hyprctl clients | grep -c "^Window"
 | 无音频 | 只传画面 | 中（PipeWire） |
 | 无剪贴板同步 | 未实现 `wl_data_device` | 中 |
 | 多客户端会竞争 | `clients[]` 没有所有权概念 | 低 |
-| 无鉴权 / 无 TLS | 只监听 127.0.0.1 | 低（如果要做远程访问则必做） |
+| 无鉴权 token / 无 TLS | 已加 Origin+Host 校验，但无 token | 低（要远程访问则必做） |
 | 仅 wlroots 系合成器 | screencopy / virtual_pointer 是 wlroots 私有协议 | 高 |
 
 ### 如果要继续做，建议顺序
 
-1. **剪贴板同步** —— 实用性提升最大，改动局部（`inject_*` 旁边加 `wl_data_device` 处理）
-2. **多客户端管理** —— 修掉竞争问题，为「多人围观」铺路
-3. **XWayland 支持** —— 让 firefox / Electron 应用能用（目前它们会走 X11）
-4. 音频 —— 依赖 PipeWire，与 Wayland 协议无关，是独立子系统
+1. **剪贴板 / 正文直传** —— 实用性提升最大。顺带解决「打不了中文」：
+   逐键注入永远解决不了非 ASCII，必须在 WS 协议里加一条「把这段文本塞进去」的通道
+   （或走 `wl_data_device` 剪贴板）
+2. **CI 加键鼠注入回归测试** —— 现在 5 个坑全靠人工复验，CI 只测了快照抓帧
+3. **多客户端所有权** —— 并发越界已修，但「谁在操作」仍无概念，两个浏览器同时接管会互相抢
+4. **XWayland 支持** —— 注意：firefox 加 `MOZ_ENABLE_WAYLAND=1`、Electron 加
+   `--ozone-platform=wayland` 就是原生 Wayland，**成本远低于实现 X11 输入注入**，先试这个
+5. 音频 —— 依赖 PipeWire，与 Wayland 协议无关，是独立子系统
 
 ### 代码里刻意留下的扩展点
 
@@ -250,7 +302,8 @@ cat CHANGELOG.md           # 看修过什么
 # 浏览器打开 http://127.0.0.1:8765，点画面，打字试试
 ```
 
-**动手改代码之前，先把第 3 节的五个坑读一遍。** 那些都是几小时起步的排查成本。
+**动手改代码之前，先把第 3 节的七个坑读一遍。** 前 5 个是几小时起步的排查成本，
+坑 6 是安全漏洞，坑 7 是随机越界。
 
 ---
 

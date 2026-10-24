@@ -84,7 +84,9 @@ import socket, base64, time, struct, os
 
 def ws_connect(port=8765):
     s = socket.create_connection(('127.0.0.1', port), timeout=8)
-    s.sendall(b"GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+    # ⚠️ Host 必须是回环地址；Origin 可省略（省略 = 本机进程，放行），
+    #    但填了就必须是本页来源，否则服务端回 403。
+    s.sendall(b"GET /ws HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nUpgrade: websocket\r\n"
               b"Connection: Upgrade\r\nSec-WebSocket-Key: " +
               base64.b64encode(b"abcdefgh12345678") +
               b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
@@ -221,6 +223,8 @@ hyprctl cursorpos
 | 只有左半边能点 | 坐标按 int16 读了 | 见 `docs/HANDOFF.md` 坑 3 |
 | 打字乱码（a→l） | 键码多加了 8 | 见 `docs/HANDOFF.md` 坑 1 |
 | 打字完全无反应 | WS 帧不是 8 字节 | 见 `docs/HANDOFF.md` 坑 2 |
+| 握手回 403 | `Host`/`Origin` 不是本机来源 | 用 `Host: 127.0.0.1:8765`，别带外站 `Origin`，见坑 6 |
+| 服务随机崩 / 越界 | `clients[]` 跨 poll 用下标 | 见 `docs/HANDOFF.md` 坑 7 |
 | 窗口跑到用户桌面上 | 没 `env -u DISPLAY` | 见 `docs/HANDOFF.md` 坑 5 |
 | `sway: Operation not permitted` | 容器缺 `CAP_SYS_NICE` | `start.sh` 已自动绕过；或 `--cap-add SYS_NICE` |
 
@@ -233,7 +237,8 @@ hyprctl cursorpos
 | 限制 | 说明 |
 |---|---|
 | **XWayland 程序注不进去** | firefox / Electron 默认走 X11，wstream 只能操作原生 Wayland 客户端。要让它们走 Wayland：加 `MOZ_ENABLE_WAYLAND=1`（firefox）或 `--ozone-platform=wayland`（Electron/Chromium） |
-| 只能本机访问 | 只监听 `127.0.0.1`，无鉴权无 TLS |
+| 只能本机访问 | 只监听 `127.0.0.1`；已校验 `Host`/`Origin`，但无 token、无 TLS |
+| **打不了中文/非 ASCII** | 逐键注入 + 无 IME。要输入中文只能走剪贴板（尚未实现） |
 | 无音频 | 只传画面 |
 | 无剪贴板同步 | 沙箱与宿主机剪贴板不通 |
 | 仅 wlroots 系合成器 | sway / labwc 可以；Hyprland 的 headless 后端受限于 aquamarine |
@@ -247,6 +252,7 @@ hyprctl cursorpos
 2. **不要用 `pkill -f <关键字>`** —— bash 自己的命令行也含该字符串，会杀掉自己。
    用 `pgrep -x`（精确匹配进程名）。
 3. **不要高频截图循环给用户看** —— 用户明确反感。要看画面就让他自己开浏览器。
+   （验证时抓 1~2 张确认即可。）
 4. 启动沙箱里的任何 GUI 程序前，先想一遍 `DISPLAY` 是否被隔离了。
 
 ---
