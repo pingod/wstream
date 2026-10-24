@@ -19,6 +19,32 @@ PORT="${WSTREAM_PORT:-8765}"
 log() { printf '\033[1;36m[wstream]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[wstream]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# 进程是不是僵尸（已退出但还没被父进程 reap）。
+# ⚠️ 为什么需要：Docker/CI 容器里 PID 1 往往不 reap 子进程，被 kill 的进程
+# 会一直以 <defunct> 状态存在，`pgrep`/`kill -0` **照样能匹配到它**。
+# 踩过：CI 里 stop 之后下一步 start 说「wstream 已在运行」，但端口根本不响应，
+# 于是回归测试全部 Connection refused。
+is_zombie() {
+  [ -r "/proc/$1/stat" ] || return 1
+  # stat 的第 3 个字段是状态，Z = zombie
+  st=$(awk '{print $3}' "/proc/$1/stat" 2>/dev/null)
+  [ "$st" = "Z" ]
+}
+
+# 真的活着吗：进程在、不是僵尸。
+alive() {
+  p=$1
+  [ -n "${p:-}" ] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  ! is_zombie "$p"
+}
+
+# 端口上有没有人在服务（比「进程存在」可靠得多）
+port_serving() {
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$1/" 2>/dev/null
+}
+
 stop_all() {
   for f in "$ROOT"/*.pid; do
     [ -f "$f" ] || continue
@@ -27,12 +53,23 @@ stop_all() {
     rm -f "$f"
   done
   # 兜底：只杀 XDG_RUNTIME_DIR 指向沙箱的进程，绝不误伤用户自己的桌面
-  for p in $(pgrep -x sway 2>/dev/null) $(pgrep -x wstream 2>/dev/null); do
+  for p in $(pgrep -x sway 2>/dev/null) $(pgrep -x wstream 2>/dev/null) \
+           $(pgrep -x sway-nocap 2>/dev/null); do
+    is_zombie "$p" && continue          # 已经死了，不用管
     [ -r "/proc/$p/environ" ] || continue
     rt=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | sed -n 's/^XDG_RUNTIME_DIR=//p')
     [ "$rt" = "$ROOT/run" ] && kill "$p" 2>/dev/null
   done
-  sleep 0.5
+  # 等它们真的退出（最多 5 秒），别让下一步 start 撞上还没死透的进程
+  i=0
+  while [ $i -lt 25 ]; do
+    busy=""
+    for p in $(pgrep -x wstream 2>/dev/null); do
+      is_zombie "$p" || busy="$p"
+    done
+    [ -z "$busy" ] && break
+    sleep 0.2; i=$((i+1))
+  done
   log "已停止"
 }
 
@@ -119,15 +156,46 @@ XEOF
 fi
 
 # ---------- 2. wstream ----------
-if pgrep -x wstream >/dev/null 2>&1; then
-  log "wstream 已在运行"
+# ⚠️ 判据是「端口真的在服务」，不是「有个叫 wstream 的进程」。
+# 容器里被 kill 的进程会变成僵尸、pgrep 仍能匹配（见 is_zombie 的说明）。
+RUNNING=""
+for p in $(pgrep -x wstream 2>/dev/null); do
+  if alive "$p"; then RUNNING=1; fi
+done
+if [ -n "$RUNNING" ] && port_serving "$PORT"; then
+  log "wstream 已在运行（端口 $PORT 可服务）"
 else
+  # 有进程但不服务 → 僵尸或卡死，先清掉
+  for p in $(pgrep -x wstream 2>/dev/null); do
+    kill -9 "$p" 2>/dev/null
+  done
   log "启动 wstream（端口 $PORT）…"
   setsid env -u DISPLAY \
     XDG_RUNTIME_DIR="$ROOT/run" WAYLAND_DISPLAY="$WL" \
     "$REPO/wstream" -p "$PORT" -f 10 -v >> "$ROOT/wstream.log" 2>&1 < /dev/null &
   echo $! > "$ROOT/wstream.pid"
-  sleep 2
+
+  # 等端口真的能服务（内部要连 Wayland、建 shmbuf、初始化虚拟设备，
+  # 光 sleep 2 秒在慢机器/容器里不够 —— 踩过：返回后测试立刻连接被拒）
+  i=0
+  while [ $i -lt 100 ]; do
+    if port_serving "$PORT"; then break; fi
+    # 进程提前挂了就别再等
+    W=$(cat "$ROOT/wstream.pid" 2>/dev/null)
+    if [ -n "${W:-}" ] && ! alive "$W"; then
+      echo "──── wstream.log ────" >&2
+      tail -20 "$ROOT/wstream.log" >&2 2>/dev/null
+      echo "─────────────────────" >&2
+      die "wstream 启动后立即退出（日志见上）"
+    fi
+    sleep 0.2; i=$((i+1))
+  done
+  if ! port_serving "$PORT"; then
+    echo "──── wstream.log ────" >&2
+    tail -20 "$ROOT/wstream.log" >&2 2>/dev/null
+    echo "─────────────────────" >&2
+    die "wstream 已启动但端口 $PORT 一直不可服务"
+  fi
 fi
 
 log "──────────────────────────────────────────"
