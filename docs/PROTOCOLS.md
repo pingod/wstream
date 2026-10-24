@@ -12,6 +12,7 @@
 | `wl_shm` | 1 | 缓冲 | 共享内存传像素 |
 | `wl_output` | 4 | 查询 | 获取输出尺寸/格式 |
 | `wl_seat` | 7 | 绑定 | 虚拟设备挂载点 |
+| `zwlr_data_control_manager_v1` | 1 | 剪贴板 | 读写沙箱剪贴板（**不需要焦点**） |
 
 ### 都是 wlroots 系协议
 
@@ -295,7 +296,67 @@ zwp_virtual_keyboard_v1_modifiers(kbd, mods, 0, 0, 0);
 
 ---
 
-## 五、HTTP / WebSocket
+## 五、剪贴板：`zwlr_data_control`
+
+### 为什么不是 `wl_data_device`
+
+标准剪贴板协议 `wl_data_device.set_selection()` **要求调用方的 surface 有焦点**。
+wstream 根本没有任何窗口（这是项目的核心设计），所以那条路走不通。
+
+`zwlr_data_control` 是**专门给剪贴板管理器**设计的协议，不需要焦点。
+实测在无头 sway 里 `wl-copy` / `wl-paste` 完全正常。
+
+`ext_data_control_v1`（wayland-protocols staging）是它的标准化版本，
+语义一致；本实现用 wlroots 那份，兼容性更广。
+
+### 事件顺序（这里有个必须记住的坑）
+
+```
+data_offer(offer对象)  →  offer("text/plain") × N  →  selection(offer)
+```
+
+**监听器必须在 `data_offer` 里立刻挂上。** 如果等 `selection` 才
+`add_listener`，中间的 `offer` 事件到达时没有监听者，被 libwayland 直接
+discard —— 日志里是一堆 `discarded ...offer("text/plain")`，
+然后就永远不知道有哪些 mime 可读。
+
+### 读取流程
+
+```c
+/* data_offer：立刻挂监听器，用 user_data 把上下文绑到对象上 */
+ctx = calloc(...);
+zwlr_data_control_offer_v1_add_listener(offer, &offer_listener, ctx);
+zwlr_data_control_offer_v1_set_user_data(offer, ctx);
+
+/* selection：roundtrip 让 offer 事件到齐，挑一个文本 mime，receive 到管道 */
+pipe(fds);
+zwlr_data_control_offer_v1_receive(offer, mime, fds[1]);
+close(fds[1]);
+wl_display_roundtrip(display);   /* 合成器这之后才会把数据写进管道 */
+read(fds[0], ...);
+```
+
+### 写入流程
+
+```c
+src = zwlr_data_control_manager_v1_create_data_source(mgr);
+zwlr_data_control_source_v1_add_listener(src, &src_listener, NULL);
+zwlr_data_control_source_v1_offer(src, "text/plain;charset=utf-8");
+zwlr_data_control_source_v1_offer(src, "UTF8_STRING");   /* 兼容终端 */
+zwlr_data_control_device_v1_set_selection(dev, src);
+```
+
+**source 必须一直活着**：合成器在别人来取数据时会发 `send` 事件，我们在这个
+回调里把文本写进 fd。source 销毁了数据源就没了。
+
+### 隔离性
+
+沙箱剪贴板与宿主机剪贴板**真隔离**（实测：沙箱里 `wl-copy` 的内容，
+宿主机 `wl-paste` 读到的是用户自己的内容）。桥接的是「浏览器页面」↔「沙箱」。
+
+---
+
+## 六、HTTP / WebSocket
 
 ### 为什么不用现成库
 
@@ -375,7 +436,7 @@ byte 1 是 flags 位，前端恒为 0 —— 读错的话「取权」会被当�
 
 ---
 
-## 六、并发模型
+## 七、并发模型
 
 ### 约束
 
@@ -431,7 +492,7 @@ static int client_by_id(unsigned long id) { ... }
 
 ---
 
-## 七、协议扩展方向
+## 八、协议扩展方向
 
 | 需求 | 需要的协议 |
 |---|---|

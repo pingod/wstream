@@ -51,6 +51,7 @@
 #include "wlr-screencopy.h"
 #include "wlr-virtual-pointer.h"
 #include "virtual-keyboard.h"
+#include "wlr-data-control.h"
 
 /* ============================================================ 基础工具 */
 
@@ -141,6 +142,10 @@ struct capture {
     struct zwlr_virtual_pointer_v1 *ptr;
     struct zwp_virtual_keyboard_v1 *kbd;
 
+    /* 剪贴板（data-control 协议，不需要焦点，专给剪贴板管理器用） */
+    struct zwlr_data_control_manager_v1 *dc_mgr;
+    struct zwlr_data_control_device_v1  *dc_dev;
+
     int frame_ready, frame_failed;
     int probed;      /* 是否已经做过 shm 格式 roundtrip */
     int fb_w, fb_h;
@@ -175,6 +180,9 @@ static void on_global(void *data, struct wl_registry *reg, uint32_t name,
                                       version < 2 ? version : 2);
     } else if (!strcmp(iface, zwp_virtual_keyboard_manager_v1_interface.name)) {
         c->kbd_mgr = wl_registry_bind(reg, name, &zwp_virtual_keyboard_manager_v1_interface, 1);
+    } else if (!strcmp(iface, zwlr_data_control_manager_v1_interface.name)) {
+        c->dc_mgr = wl_registry_bind(reg, name, &zwlr_data_control_manager_v1_interface,
+                                     version < 1 ? version : 1);
     }
 }
 static void on_global_remove(void *d, struct wl_registry *r, uint32_t n) { (void)d; (void)r; (void)n; }
@@ -514,6 +522,243 @@ static int ascii_needs_shift(int c) {
     }
 }
 
+/* ============================================================ 剪贴板同步
+ *
+ * 用 zwlr_data_control（不是 wl_data_device）：
+ *   wl_data_device 要求 surface 有焦点才能 set_selection，而 wstream 根本没有
+ *   窗口（这是项目的核心设计）。data-control 是专门给「剪贴板管理器」用的协议，
+ *   不需要焦点 —— 实测在无头 sway 里 `wl-copy`/`wl-paste` 完全正常。
+ *
+ * 两个方向：
+ *   沙箱 → 浏览器：合成器发 selection 事件 → 我们 receive 数据 → 通过 WS 发给页面
+ *   浏览器 → 沙箱：页面发 type 7 → 我们 create_data_source + set_selection
+ *
+ * ⚠️ 沙箱剪贴板和宿主机剪贴板是**真隔离**的（实测：沙箱里写的内容，
+ *    宿主机 wl-paste 读不到，读到的是用户自己的内容）。所以这不涉及
+ *    往用户桌面泄漏任何东西 —— 桥接的是「浏览器页面」和「沙箱」。
+ *
+ * 数据大小上限：超过 CLIP_MAX 就截断。剪贴板里可能是几个 G 的文件，
+ * 不能无脑往内存里灌。
+ */
+#define CLIP_MAX (256 * 1024)
+
+/* 沙箱当前剪贴板内容（我们读到之后缓存一份，页面连上时直接给） */
+static char   g_clip_text[CLIP_MAX];
+static size_t g_clip_len;
+static int    g_clip_ver;          /* 每次变化 +1，页面据此判断要不要拉 */
+static pthread_mutex_t g_clip_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* 浏览器最近一次推过来的文本，作为「沙箱剪贴板的来源」 */
+static char   g_clip_out[CLIP_MAX];
+static size_t g_clip_out_len;
+static struct zwlr_data_control_source_v1 *g_clip_source;   /* 当前持有者 */
+
+/* 正在 receive 的 fd：读完后把数据塞进 g_clip_text */
+static void clip_read_fd(int fd) {
+    char buf[8192];
+    size_t total = 0;
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n <= 0) break;
+        if (total + (size_t)n >= CLIP_MAX) {   /* 超限截断 */
+            size_t room = CLIP_MAX - 1 - total;
+            if (room > 0) { memcpy(g_clip_text + total, buf, room); total += room; }
+            break;
+        }
+        memcpy(g_clip_text + total, buf, (size_t)n);
+        total += (size_t)n;
+    }
+    close(fd);
+    pthread_mutex_lock(&g_clip_mu);
+    g_clip_text[total] = 0;
+    g_clip_len = total;
+    g_clip_ver++;
+    pthread_mutex_unlock(&g_clip_mu);
+    if (g_verbose) logf_("📋 沙箱剪贴板更新：%zu 字节", total);
+}
+
+/* ---------- offer 监听：收集 mime，等 selection 之后再读 ----------
+ *
+ * ⚠️ 关键顺序（踩过，日志里表现为一堆 `discarded ...offer("text/plain")`）：
+ *   合成器发事件的顺序是
+ *       data_offer(offer对象)  →  offer("text/plain") × N  →  selection(offer)
+ *   所以**监听器必须在 data_offer 里就加上**。如果等到 selection 里才 add_listener，
+ *   前面那些 offer 事件已经到达、没有监听者，被 libwayland 直接 discard，
+ *   我们就永远不知道有哪些 mime 可用，也就读不到数据。
+ *
+ * 每个 offer 对象配一个 clip_offer_ctx 记录它支持哪些 mime。 */
+
+#define OFFER_MAX_MIME 8
+#define OFFER_MIME_LEN 64
+
+struct clip_offer_ctx {
+    char mime[OFFER_MAX_MIME][OFFER_MIME_LEN];
+    int  n;
+    struct clip_offer_ctx *next;   /* 单向链表，方便按对象查找 */
+};
+static struct clip_offer_ctx *g_offers;
+
+static void offer_mime(void *data, struct zwlr_data_control_offer_v1 *offer,
+                       const char *mime) {
+    struct clip_offer_ctx *ctx = data;
+    (void)offer;
+    if (!ctx || ctx->n >= OFFER_MAX_MIME) return;
+    snprintf(ctx->mime[ctx->n], OFFER_MIME_LEN, "%s", mime);
+    ctx->n++;
+}
+
+static const struct zwlr_data_control_offer_v1_listener offer_listener = {
+    .offer = offer_mime,
+};
+
+/* 从收集到的 mime 里挑一个能读文本的 */
+static const char *pick_text_mime(struct clip_offer_ctx *ctx) {
+    if (!ctx) return NULL;
+    /* 优先级：明确 UTF-8 的最可靠 */
+    static const char *pref[] = {
+        "text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"
+    };
+    for (size_t p = 0; p < sizeof pref / sizeof pref[0]; p++)
+        for (int i = 0; i < ctx->n; i++)
+            if (!strcmp(ctx->mime[i], pref[p])) return ctx->mime[i];
+    return NULL;
+}
+
+/* ---------- device 监听：selection 变化 ---------- */
+static void dc_data_offer(void *data, struct zwlr_data_control_device_v1 *dev,
+                          struct zwlr_data_control_offer_v1 *offer) {
+    (void)dev;
+    struct capture *c = data;
+    /* 立刻挂监听器并记下上下文（对象在 selection 里还会用到） */
+    struct clip_offer_ctx *ctx = calloc(1, sizeof *ctx);
+    if (!ctx) return;
+    ctx->next = g_offers;
+    g_offers = ctx;
+    zwlr_data_control_offer_v1_add_listener(offer, &offer_listener, ctx);
+    /* 把 ctx 关联到 offer 对象，selection 时反查 */
+    zwlr_data_control_offer_v1_set_user_data(offer, ctx);
+    (void)c;
+}
+
+static void dc_selection(void *data, struct zwlr_data_control_device_v1 *dev,
+                         struct zwlr_data_control_offer_v1 *offer) {
+    (void)data; (void)dev;
+    if (!offer) {   /* NULL = 剪贴板被清空 */
+        pthread_mutex_lock(&g_clip_mu);
+        g_clip_len = 0; g_clip_text[0] = 0; g_clip_ver++;
+        pthread_mutex_unlock(&g_clip_mu);
+        return;
+    }
+    struct clip_offer_ctx *ctx = zwlr_data_control_offer_v1_get_user_data(offer);
+    /* offer 事件可能还没处理完，先做一次 roundtrip 让它们到齐 */
+    wl_display_roundtrip(cap.display);
+    const char *mime = pick_text_mime(ctx);
+    if (!mime) {
+        if (g_verbose) logf_("📋 剪贴板里没有文本类型（%d 种 mime）", ctx ? ctx->n : 0);
+        return;
+    }
+    int fds[2];
+    if (pipe(fds) != 0) return;
+    zwlr_data_control_offer_v1_receive(offer, mime, fds[1]);
+    close(fds[1]);
+    /* receive 之后要 roundtrip，合成器才会把数据写进管道 */
+    wl_display_roundtrip(cap.display);
+    clip_read_fd(fds[0]);
+}
+static void dc_finished(void *data, struct zwlr_data_control_device_v1 *dev) {
+    (void)data; (void)dev;
+    logf_("⚠️ 剪贴板 device 失效（合成器不再支持 data-control）");
+}
+static void dc_primary(void *data, struct zwlr_data_control_device_v1 *dev,
+                       struct zwlr_data_control_offer_v1 *offer) {
+    (void)data; (void)dev; (void)offer;   /* 主选区暂不处理 */
+}
+static const struct zwlr_data_control_device_v1_listener dc_dev_listener = {
+    .data_offer = dc_data_offer,
+    .selection = dc_selection,
+    .finished = dc_finished,
+    .primary_selection = dc_primary,
+};
+
+/* ---------- source 监听：浏览器推来的文本，合成器来取 ---------- */
+static void src_send(void *data, struct zwlr_data_control_source_v1 *src,
+                     const char *mime, int32_t fd) {
+    (void)data; (void)src;
+    /* 不管它要什么 mime，都给同一份 UTF-8 文本 */
+    if (!strncmp(mime, "text/", 5) || !strcmp(mime, "UTF8_STRING") ||
+        !strcmp(mime, "STRING") || !strcmp(mime, "TEXT")) {
+        size_t off = 0;
+        while (off < g_clip_out_len) {
+            ssize_t n = write(fd, g_clip_out + off, g_clip_out_len - off);
+            if (n <= 0) break;
+            off += (size_t)n;
+        }
+    }
+    close(fd);
+}
+static void src_cancelled(void *data, struct zwlr_data_control_source_v1 *src) {
+    (void)data;
+    if (src == g_clip_source) g_clip_source = NULL;
+    zwlr_data_control_source_v1_destroy(src);
+}
+static const struct zwlr_data_control_source_v1_listener src_listener = {
+    .send = src_send,
+    .cancelled = src_cancelled,
+};
+
+/* 初始化剪贴板桥。失败不影响其它功能。 */
+static void clipboard_init(struct capture *c) {
+    if (!c->dc_mgr || !c->seat) {
+        logf_("ℹ️ 合成器不支持 data-control → 剪贴板同步关闭");
+        return;
+    }
+    c->dc_dev = zwlr_data_control_manager_v1_get_data_device(c->dc_mgr, c->seat);
+    if (!c->dc_dev) { logf_("⚠️ 创建剪贴板 device 失败"); return; }
+    zwlr_data_control_device_v1_add_listener(c->dc_dev, &dc_dev_listener, c);
+    wl_display_roundtrip(c->display);   /* 拿一次当前剪贴板 */
+    logf_("✅ 剪贴板同步已就绪（data-control）");
+}
+
+/* 浏览器 → 沙箱：把文本设成沙箱剪贴板。
+ * **只在主线程调用**（要 roundtrip）。返回 0 成功。 */
+static int clipboard_set(const char *text, size_t n) {
+    if (!cap.dc_mgr || !cap.dc_dev) return -1;
+    if (n >= CLIP_MAX) n = CLIP_MAX - 1;
+    memcpy(g_clip_out, text, n);
+    g_clip_out[n] = 0;
+    g_clip_out_len = n;
+
+    struct zwlr_data_control_source_v1 *src =
+        zwlr_data_control_manager_v1_create_data_source(cap.dc_mgr);
+    if (!src) return -1;
+    zwlr_data_control_source_v1_add_listener(src, &src_listener, NULL);
+    /* 声明多种 mime，兼容 GTK / Qt / 终端 */
+    zwlr_data_control_source_v1_offer(src, "text/plain;charset=utf-8");
+    zwlr_data_control_source_v1_offer(src, "text/plain");
+    zwlr_data_control_source_v1_offer(src, "UTF8_STRING");
+    zwlr_data_control_source_v1_offer(src, "STRING");
+    zwlr_data_control_device_v1_set_selection(cap.dc_dev, src);
+    if (g_clip_source && g_clip_source != src)
+        zwlr_data_control_source_v1_destroy(g_clip_source);
+    g_clip_source = src;
+    wl_display_roundtrip(cap.display);
+    if (g_verbose) logf_("📋 浏览器 → 沙箱剪贴板：%zu 字节", n);
+    return 0;
+}
+
+/* 取当前沙箱剪贴板快照（给 WS 用）。返回长度，out 已 NUL 结尾。 */
+static size_t clipboard_get(char *out, size_t cap, int *ver) {
+    size_t n;
+    pthread_mutex_lock(&g_clip_mu);
+    n = g_clip_len;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, g_clip_text, n);
+    out[n] = 0;
+    if (ver) *ver = g_clip_ver;
+    pthread_mutex_unlock(&g_clip_mu);
+    return n;
+}
+
 /* ---------- 任意 Unicode 字符注入（中文 / emoji / 任意符号） ----------
  *
  * 为什么不能靠 evdev 键码：键盘布局里根本没有「中」这个键。要打非 ASCII，
@@ -816,6 +1061,8 @@ static const char INDEX_HTML[] =
     "border:1px solid #fff;border-radius:50%;box-shadow:0 0 4px #000,inset 0 0 3px #000;display:none}\n"
     "#bar{margin:11px;letter-spacing:.06em;font-size:11px;text-transform:uppercase}\n"
     "#bar b{color:#4ade80;font-weight:600}\n"
+    "#clipbar{margin:0 11px 8px;font-size:10px;color:#666;letter-spacing:.04em}\n"
+    "#clipbar b{color:#93c5fd;font-weight:500}\n"
     "#k{position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;"
     "border:0;padding:0;background:transparent;color:transparent;pointer-events:none}\n"
     "#hint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;"
@@ -825,6 +1072,7 @@ static const char INDEX_HTML[] =
     "<div id=wrap><img id=v src=\"/stream.mjpg\"><div id=cur></div>"
     "<div id=hint>点击画面开始操作</div></div>\n"
     "<div id=bar>agent sandbox · <b id=st>连接中…</b> · 点画面接管（同一时刻只有一人能操作）· Ctrl+Esc 释放</div>\n"
+    "<div id=clipbar>📋 <b id=st2>剪贴板未同步</b> · Ctrl+Shift+V 粘贴到我电脑</div>\n"
     "<input id=k autocomplete=off spellcheck=false>\n"
     "<script>\n"
     "const v=document.getElementById('v'),cur=document.getElementById('cur'),st=document.getElementById('st'),\n"
@@ -835,6 +1083,15 @@ static const char INDEX_HTML[] =
     "  ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');\n"
     "  ws.binaryType='arraybuffer';\n"
     "  ws.onopen=()=>{st.textContent='画面 + 输入已连接';st.style.color='#4ade80';};\n"
+    "  ws.onmessage=ev=>{\n"
+    "    const b=new Uint8Array(ev.data);\n"
+    "    if(b.length<8)return;\n"
+    "    if(b[0]===0x81){            /* 0x81 = 下行剪贴板内容 */\n"
+    "      const txt=new TextDecoder().decode(b.subarray(8));\n"
+    "      sandboxClip=txt;\n"
+    "      st2.textContent = txt ? ('沙箱剪贴板: '+txt.slice(0,24)+(txt.length>24?'…':'')) : '沙箱剪贴板为空';\n"
+    "    }\n"
+    "  };\n"
     "  ws.onclose=()=>{st.textContent='已断开，重连中…';st.style.color='#f87171';release();setTimeout(conn,1200);};\n"
     "  ws.onerror=()=>ws.close();\n"
     "}\n"
@@ -918,14 +1175,53 @@ static const char INDEX_HTML[] =
     "  if(!active||composing)return;e.preventDefault();\n"
     "  const c=evdev(e);if(c)send(4,c,0);\n"
     "});\n"
-    "/* 粘贴：整段文本原样送过去，中文/多行都没问题 */\n"
+    "/* ---------- 剪贴板 ---------- */\n"
+    "let sandboxClip='';\n"
+    "/* 请求沙箱当前剪贴板（type 8），响应会走下行 0x81 */\n"
+    "function clipPull(){ if(ws&&ws.readyState===1) send(8,0,0); }\n"
+    "/* 把文本设成沙箱剪贴板（type 7）*/\n"
+    "function clipPush(t){\n"
+    "  if(!ws||ws.readyState!==1)return;\n"
+    "  const enc=new TextEncoder().encode(t);\n"
+    "  const bf=new Uint8Array(8+enc.length);\n"
+    "  bf[0]=7; bf.set(enc,8); ws.send(bf);\n"
+    "}\n"
+    "setInterval(clipPull, 2000);   /* 定期同步沙箱剪贴板过来 */\n"
+    "/* 粘贴。两条路：\n"
+    " *   普通粘贴（Ctrl+V）：把文本**写进沙箱剪贴板**再发 Ctrl+V。\n"
+    " *     为什么绕这一圈？因为逐键只能解决原生 Wayland 客户端；Xwayland\n"
+    " *     有独立 keymap，打不了中文。走剪贴板粘贴则所有程序都能用。\n"
+    " *   Ctrl+Shift+V：反过来，把**沙箱的**剪贴板内容贴到我自己的电脑上。\n"
+    " */\n"
     "k.addEventListener('paste',e=>{\n"
     "  if(!active)return;\n"
     "  e.preventDefault();\n"
-    "  const t=(e.clipboardData||window.clipboardData).getData('text');\n"
-    "  if(t)sendText(t);\n"
+    "  const raw=(e.clipboardData||window.clipboardData).getData('text');\n"
+    "  if(!raw)return;\n"
+    "  const asciiOnly=/^[\\x00-\\x7F]*$/.test(raw);\n"
+    "  if(asciiOnly){\n"
+    "    sendText(raw);              /* 纯 ASCII 直接逐键打，最省事 */\n"
+    "  }else{\n"
+    "    /* 含非 ASCII：走剪贴板，保证 Xwayland 程序也能收到 */\n"
+    "    clipPush(raw);\n"
+    "    setTimeout(()=>{ send(4,29,1); send(4,47,1); send(4,47,0); send(4,29,0); }, 120);\n"
+    "  }\n"
     "  k.value='';\n"
     "});\n"
+    "/* Ctrl+Shift+V：把沙箱剪贴板内容复制到宿主机剪贴板（用浏览器 API） */\n"
+    "k.addEventListener('keydown', e=>{\n"
+    "  if(!active)return;\n"
+    "  if((e.ctrlKey||e.metaKey)&&e.shiftKey&&(e.key==='V'||e.key==='v')){\n"
+    "    e.preventDefault();\n"
+    "    clipPull();\n"
+    "    setTimeout(async()=>{\n"
+    "      if(!sandboxClip)return;\n"
+    "      try{ await navigator.clipboard.writeText(sandboxClip);\n"
+    "           st2.textContent='已复制到你的剪贴板: '+sandboxClip.slice(0,20); }\n"
+    "      catch(err){ st2.textContent='复制失败（浏览器限制）'; }\n"
+    "    }, 200);\n"
+    "  }\n"
+    "}, true);\n"
     "/* 兜底：万一 input 事件拿到了非 ASCII（部分浏览器 IME 行为不一致），\n"
     " * 也送过去；纯 ASCII 忽略，避免和 keydown 重复。 */\n"
     "k.addEventListener('input',e=>{\n"
@@ -993,6 +1289,59 @@ static void push_frame(const uint8_t *data, size_t len) {
             drop_client(i);
     }
     pthread_mutex_unlock(&g_cl_mu);
+}
+
+/* 把一个 WS 帧推给**单个**客户端（按 id）。用于剪贴板响应。
+ * **调用方必须持有 g_cl_mu。** */
+static void ws_send_frame_locked(struct client *c, int opcode,
+                                 const void *payload, size_t n) {
+    if (!c || !c->is_ws || c->fd < 0) return;
+    uint8_t hdr[10];
+    size_t hn;
+    if (n < 126) {
+        hdr[0] = (uint8_t)(0x80 | opcode);
+        hdr[1] = (uint8_t)n;
+        hn = 2;
+    } else if (n < 65536) {
+        hdr[0] = (uint8_t)(0x80 | opcode);
+        hdr[1] = 126;
+        hdr[2] = (uint8_t)(n >> 8);
+        hdr[3] = (uint8_t)(n & 0xFF);
+        hn = 4;
+    } else {
+        hdr[0] = (uint8_t)(0x80 | opcode);
+        hdr[1] = 127;
+        for (int i = 0; i < 8; i++) hdr[2 + i] = (uint8_t)(n >> (56 - i * 8));
+        hn = 10;
+    }
+    /* 服务端发出的帧**不加掩码**（RFC 6455） */
+    if (send_all(c->fd, hdr, hn) < 0 || send_all(c->fd, payload, n) < 0) {
+        c->is_ws = 0;   /* 标记掉线，外层回收 */
+    }
+}
+
+/* 把剪贴板内容发给请求者。
+ * 协议（下行，opcode=2 二进制）：
+ *   [0]=0x81  [4..5]=A=版本号  [8..]=UTF-8 文本
+ * 复用 8 字节头，让前端解析逻辑和上行一致。 */
+static void push_clipboard(unsigned long req_id) {
+    char text[CLIP_MAX];
+    int ver = 0;
+    size_t n = clipboard_get(text, CLIP_MAX - 8, &ver);
+
+    uint8_t *msg = malloc(8 + n);
+    if (!msg) return;
+    memset(msg, 0, 8);
+    msg[0] = 0x81;                       /* 0x80 = 服务端→客户端，1 = 剪贴板 */
+    msg[4] = (uint8_t)(ver & 0xFF);
+    msg[5] = (uint8_t)((ver >> 8) & 0xFF);
+    if (n) memcpy(msg + 8, text, n);
+
+    pthread_mutex_lock(&g_cl_mu);
+    int idx = client_by_id(req_id);
+    if (idx >= 0) ws_send_frame_locked(&clients[idx], 2, msg, 8 + n);
+    pthread_mutex_unlock(&g_cl_mu);
+    free(msg);
 }
 
 /* 有没有人在看画面。主线程用它决定这一帧要不要编码 —— 必须走锁，
@@ -1159,6 +1508,53 @@ static size_t text_dequeue(char *out, size_t cap) {
     return n;
 }
 
+/* ---------- 剪贴板设置队列（浏览器 → 沙箱） ----------
+ * 和文本队列同样的理由：clipboard_set() 要 roundtrip，只能主线程做。 */
+static struct {
+    char buf[TEXT_Q_SLOTS][CLIP_MAX];
+    size_t len[TEXT_Q_SLOTS];
+    int head, tail, count;
+} g_cq;
+static pthread_mutex_t g_cq_mu = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_clip_dirty;    /* 主线程要处理剪贴板请求 */
+static volatile int g_clip_req;      /* 哪个客户端要读剪贴板（0 = 无） */
+
+static int clip_enqueue(const char *s, size_t n) {
+    if (n >= CLIP_MAX) return -1;
+    int ok = -1;
+    pthread_mutex_lock(&g_cq_mu);
+    if (g_cq.count < TEXT_Q_SLOTS) {
+        /* 空内容也允许（= 清空剪贴板） */
+        memcpy(g_cq.buf[g_cq.tail], s, n);
+        g_cq.len[g_cq.tail] = n;
+        g_cq.tail = (g_cq.tail + 1) % TEXT_Q_SLOTS;
+        g_cq.count++;
+        ok = 0;
+    }
+    pthread_mutex_unlock(&g_cq_mu);
+    return ok;
+}
+
+/* 取一条。返回 0 = 队列空；否则把长度写进 *out_len（可以是 0，表示清空剪贴板）。
+ * 用「返回 0/1 + 单独给长度」而不是「返回长度」：否则「队列空」和
+ * 「要清空剪贴板（长度 0）」两种情况分不开。 */
+static int clip_dequeue(char *out, size_t cap, size_t *out_len) {
+    int got = 0;
+    pthread_mutex_lock(&g_cq_mu);
+    if (g_cq.count > 0) {
+        size_t n = g_cq.len[g_cq.head];
+        if (n >= cap) n = cap - 1;
+        memcpy(out, g_cq.buf[g_cq.head], n);
+        out[n] = 0;
+        *out_len = n;
+        g_cq.head = (g_cq.head + 1) % TEXT_Q_SLOTS;
+        g_cq.count--;
+        got = 1;
+    }
+    pthread_mutex_unlock(&g_cq_mu);
+    return got;
+}
+
 /* 把 WS 帧负载交给注入器。
  * caller_id = 发送者 client id，**调用方必须持有 g_cl_mu**（要读 g_owner）。 */
 static void handle_msg(unsigned long caller_id, const uint8_t *m, size_t n) {
@@ -1182,6 +1578,23 @@ static void handle_msg(unsigned long caller_id, const uint8_t *m, size_t n) {
             g_owner = 0;
             logf_("🔓 客户端 %lu 释放输入权", caller_id);
         }
+        return;
+    }
+
+    /* ---------- 剪贴板帧：不受输入权限制 ----------
+     * 围观者也能复制沙箱里的文字、也能贴东西进来，这不应该要求接管。
+     * ⚠️ 必须放在下面的 is_owner 检查**之前**，否则会被当成输入事件丢弃 ——
+     * 踩过：页面读剪贴板一直超时，查了半天才发现是被所有权拦掉的。 */
+    if (type == 7) {
+        if (n > 8) {
+            if (clip_enqueue((const char *)m + 8, n - 8) == 0) g_clip_dirty = 1;
+            else logf_("⚠️ 剪贴板队列满或超长，丢弃 %zu 字节", n - 8);
+        }
+        return;
+    }
+    if (type == 8) {
+        g_clip_req = (int)caller_id;
+        g_clip_dirty = 1;
         return;
     }
 
@@ -1455,6 +1868,9 @@ int main(int argc, char **argv) {
     /* ---------- 输入注入 ---------- */
     input_init(&cap);
 
+    /* ---------- 剪贴板同步 ---------- */
+    clipboard_init(&cap);
+
     /* ---------- HTTP 服务 ---------- */
     int srv = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (srv < 0) die("socket: %s", strerror(errno));
@@ -1519,15 +1935,34 @@ int main(int argc, char **argv) {
              *
              * 同时把排队的文本取出来注入 —— inject_text() 需要 roundtrip，
              * 只能在这里（主线程）做。一次最多处理一条，避免长时间占住循环。 */
-            if (g_input_dirty) {
+            /* ⚠️ 这里必须同时看两个标志：g_input_dirty（键鼠/文本注入）和
+             * g_clip_dirty（剪贴板设置/读取）。踩过的坑：剪贴板请求只置了
+             * g_clip_dirty，而主循环只看 g_input_dirty，于是请求永远不被处理，
+             * 页面那边表现为「读剪贴板一直超时」。 */
+            if (g_input_dirty || g_clip_dirty) {
+                int was_input = g_input_dirty;
                 g_input_dirty = 0;
-                wl_display_roundtrip(cap.display);
+                g_clip_dirty = 0;
+                if (was_input) wl_display_roundtrip(cap.display);
                 char txt[TEXT_Q_MAX];
                 size_t tn = text_dequeue(txt, sizeof txt);
                 if (tn > 0) {
                     int got = inject_text(txt, tn);
                     if (g_verbose) logf_("⌨️ 文本注入 %d 字符 / %zu 字节", got, tn);
                 }
+                /* 剪贴板：设置 / 读取都必须在主线程（要 roundtrip）。
+                 * ⚠️ 用 static 缓冲，不要每帧 malloc 256KB —— 那在 10fps 下
+                 * 是无谓的分配压力，而且失败路径容易漏 free。 */
+                static char cb[CLIP_MAX];
+                size_t cbn = 0;
+                if (clip_dequeue(cb, sizeof cb, &cbn)) {
+                    clipboard_set(cb, cbn);
+                    /* 设完等一次，保证合成器已采纳 */
+                    wl_display_roundtrip(cap.display);
+                }
+                int req = g_clip_req;
+                g_clip_req = 0;
+                if (req) push_clipboard((unsigned long)req);
                 continue;
             }
             /* 这一分支不能省：poll 超时也要 dispatch_pending，否则已到队列的事件

@@ -317,19 +317,38 @@ sway 用 `wayland-{N}`，N 是递增的。如果之前有残留实例，新起�
 | 想加的功能 | 改哪里 |
 |---|---|
 | 音频 | 加 PipeWire 线程，前端加 `<audio>` |
-| 剪贴板同步 | `inject_*` 旁边加 `wl_data_device` 处理 |
 | 多显示器 | `struct capture` 改成数组，抓多个 output |
 | 鉴权 | `http_thread` 的 accept 后加 token 校验（已有 Origin/Host 校验） |
 | TLS | 加 OpenSSL 包装 socket |
 | 窗口级抓取 | 换成 `ext-image-copy-capture-v1` 协议 |
 
-### 已经实现的扩展点（1.1.0）
+### 已经实现的扩展点
 
 | 功能 | 实现在哪 | 设计要点 |
 |---|---|---|
 | Unicode/中文输入 | `inject_text` + `inject_unicode_codepoint` | 网络线程只入队（`g_tq`），主线程取出来注入 —— 因为要 roundtrip |
 | 输入所有权 | `g_owner` + `is_owner()` | **服务端强制**，非持有者的输入直接丢；前端隐藏按钮挡不住脚本 |
+| 剪贴板同步 | `clipboard_init` / `clipboard_set` / `clipboard_get` | 用 data-control（不要焦点）；另有独立队列 `g_cq`，同样因为要 roundtrip |
 | 回归测试 | `tests/wstest.py` | 断言「事件到达应用」，不看截图（截图会因终端刷新而不稳） |
+
+### 剪贴板的数据流
+
+```
+沙箱剪贴板                                    浏览器页面
+──────────                                    ──────────
+合成器 selection 事件
+  → dc_selection()
+  → receive → pipe → clip_read_fd()
+  → g_clip_text[] + g_clip_ver++      ──►  页面发 type 8 请求
+                                            push_clipboard() → 下行 0x81
+
+页面发 type 7（UTF-8）
+  → clip_enqueue()  ──►  主线程 clip_dequeue()
+                          → clipboard_set() → set_selection()
+                      ◄──  沙箱里任何程序 Ctrl+V 即可粘贴
+```
+
+两个方向都不受输入所有权限制 —— 围观者也能复制沙箱文字。
 
 ### 文本注入为什么必须过队列
 

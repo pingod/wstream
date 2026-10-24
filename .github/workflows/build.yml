@@ -21,7 +21,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed \
             git gcc pkgconf wayland libjpeg-turbo libxkbcommon \
-            wlr-protocols sway grim libx11 alacritty python
+            wlr-protocols sway grim libx11 alacritty python wl-clipboard
 
       - name: 环境自检
         run: |

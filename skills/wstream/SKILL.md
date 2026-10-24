@@ -185,6 +185,44 @@ def combo(s, mod, key):
     time.sleep(0.02); send(s, 4, mod, 0)
 ```
 
+### 剪贴板（输入中文的最可靠方式）
+
+逐键注入的中文到不了 XWayland（keycode 9 冲突）。要往 **X11 程序**里输入中文，
+必须走剪贴板：
+
+```python
+def set_sandbox_clipboard(s, text):
+    """type 7：把文本设成沙箱剪贴板"""
+    payload = bytes([7,0,0,0]) + struct.pack('<HH', 0, 0) + text.encode('utf-8')
+    m = os.urandom(4); n = len(payload)
+    hdr = (bytes([0x82, 0x80|n]) if n < 126
+           else bytes([0x82, 0x80|126]) + struct.pack('>H', n))
+    s.sendall(hdr + m + bytes(c ^ m[i % 4] for i, c in enumerate(payload)))
+    time.sleep(0.15)
+
+# 用法：写剪贴板 → Ctrl+V
+set_sandbox_clipboard(s, "中文内容")
+send(s, 4, 29, 1)   # Ctrl 按下
+send(s, 4, 47, 1)   # V 按下（evdev 47 = v）
+send(s, 4, 47, 0)
+send(s, 4, 29, 0)
+```
+
+读沙箱剪贴板（围观也能读，不要求接管）：
+
+```python
+send(s, 8)                 # 请求
+# 响应是下行帧：[0]=0x81 [4..5]=版本 [8..]=UTF-8 文本
+```
+
+在沙箱里**外部**操作剪贴板（不改代码，直接命令行）：
+
+```bash
+export XDG_RUNTIME_DIR=/tmp/wstream/run WAYLAND_DISPLAY=$(cat /tmp/wstream/wl_name)
+printf '内容' | wl-copy     # 写
+timeout 2 wl-paste          # 读
+```
+
 ### 方式 B：在沙箱里直接跑命令（更简单）
 
 如果只是要"在沙箱里执行某个 GUI 程序"，不用注入，直接启动即可：
@@ -255,6 +293,8 @@ hyprctl cursorpos
 | **所有输入都没反应** | 没取输入权（type 6 action=1） | 先 `take(s)`，见坑 7 相关 |
 | **点哪里都不准** | `motion_absolute` 坐标要像素不是归一化 | 见坑 8；脚本用 `move()` 即可 |
 | **点击没反应** | 按钮码要 BTN_LEFT(0x110) | 见坑 10 |
+| **页面读剪贴板超时** | type 7/8 被输入权拦了 / 主循环没查 g_clip_dirty | 见坑 15 |
+| **X11 程序里中文进不去** | 逐键到不了 XWayland | 改用剪贴板 + Ctrl+V |
 | 握手回 403 | `Host`/`Origin` 不是本机来源 | 用 `Host: 127.0.0.1:8765`，别带外站 `Origin`，见坑 6 |
 | 服务随机崩 / 越界 | `clients[]` 跨 poll 用下标 | 见 `docs/HANDOFF.md` 坑 7 |
 | 窗口跑到用户桌面上 | 没 `env -u DISPLAY` | 见 `docs/HANDOFF.md` 坑 5 |
@@ -270,7 +310,7 @@ hyprctl cursorpos
 |---|---|
 | **XWayland 程序注不进去** | firefox / Electron 默认走 X11，wstream 只能操作原生 Wayland 客户端。要让它们走 Wayland：加 `MOZ_ENABLE_WAYLAND=1`（firefox）或 `--ozone-platform=wayland`（Electron/Chromium） |
 | 只能本机访问 | 只监听 `127.0.0.1`；已校验 `Host`/`Origin`，但无 token、无 TLS |
-| **Xwayland 里打不了中文** | keycode 9 在 Xwayland 的 keymap 里是 Escape。键鼠本身可用 |
+| Xwayland 里的中文 | 逐键到不了，但**走剪贴板可以**（type 7 + Ctrl+V） |
 | 无音频 | 只传画面 |
 | 无剪贴板同步 | 沙箱与宿主机剪贴板不通 |
 | 仅 wlroots 系合成器 | sway / labwc 可以；Hyprland 的 headless 后端受限于 aquamarine |

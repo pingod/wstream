@@ -185,6 +185,31 @@ def start_probe():
     raise RuntimeError("X11 探针没能启动（看 /tmp/x11probe.log）")
 
 
+def ws_recv_frame(s, timeout=5):
+    """收一个完整的 WS 帧，返回载荷（已去掩码/头）。超时返回 None。"""
+    s.settimeout(timeout)
+    try:
+        hdr = s.recv(2)
+        if len(hdr) < 2:
+            return None
+        n = hdr[1] & 0x7F
+        if n == 126:
+            ext = s.recv(2)
+            n = struct.unpack(">H", ext)[0]
+        elif n == 127:
+            ext = s.recv(8)
+            n = struct.unpack(">Q", ext)[0]
+        buf = b""
+        while len(buf) < n:
+            chunk = s.recv(n - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+    except (socket.timeout, OSError):
+        return None
+
+
 def probe_output(log):
     try:
         with open(log) as f:
@@ -436,7 +461,44 @@ def main():
               f"(按键数 {n_before} → {n_after})")
 
         s.close()
+
+        print("── 8. 剪贴板双向同步 ──")
+        # 8a. 沙箱 → 浏览器：先在沙箱里写剪贴板，再让页面读
+        typed_cb = "/tmp/wstream_cb_src.txt"
+        with open(typed_cb, "wb") as f:
+            f.write("沙箱剪贴板内容 abc".encode())
+        # ⚠️ 用 Popen 不用 run：wl-copy 默认 fork 到后台常驻来持有 selection
+        # source，run() 会一直等它退出 → 撞 timeout（踩过）。
+        # 必须让它活着，否则数据源消失、这边读到的就是空。
+        cbproc = subprocess.Popen(["wl-copy"], stdin=open(typed_cb, "rb"),
+                                  env=env, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+        time.sleep(1.5)
+        # 剪贴板帧不受输入权限制（围观者也能复制），用 s2 验证这一点
+        # 先发 type 8 请求
+        ws_send(s2, 8)
+        got = ws_recv_frame(s2, timeout=6)
+        if got and len(got) >= 10 and got[0] == 0x81:
+            text = got[8:].decode("utf-8", "replace")
+            check("沙箱剪贴板能被页面读取", "沙箱剪贴板内容" in text, f"(读到={text!r})")
+        else:
+            check("沙箱剪贴板能被页面读取", False, f"(响应={got!r})")
+
+        # 8b. 浏览器 → 沙箱：页面推文本，沙箱 wl-paste 应该读到
+        payload = bytes([7, 0, 0, 0]) + struct.pack("<HH", 0, 0) + \
+                  "页面推来的内容 123".encode()
+        _ws_frame(s2, payload)
+        time.sleep(1.5)
+        pasted = subprocess.run(["wl-paste"], env=env, capture_output=True,
+                                timeout=10).stdout.decode("utf-8", "replace")
+        check("页面能把文本写进沙箱剪贴板", "页面推来的内容" in pasted,
+              f"(wl-paste 读到={pasted!r})")
+
         s2.close()
+        try:
+            cbproc.terminate()
+        except Exception:
+            pass
     finally:
         try:
             probe.terminate()
