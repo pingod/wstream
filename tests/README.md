@@ -36,7 +36,7 @@ python3 tests/wstest.py
 | 8 | 剪贴板双向同步 | data-control 不能要求焦点；type 7/8 不能被所有权拦掉 |
 | 9 | 修饰键释放 | Shift 松开后必须发 modifiers=0，否则 `Upper` → `UPPER` |
 
-## 四个容易踩的测试环境问题
+## 五个容易踩的测试环境问题
 
 **① `SWAYSOCK` 必须显式设置。**
 `swaymsg` 靠它找 IPC socket，没设就报 `Unable to retrieve socket path`，
@@ -50,7 +50,17 @@ python3 tests/wstest.py
 它要活着持有 selection source（数据源），`run()` 会一直等到超时。用 `Popen`
 且不要 `wait()`。
 
-**④ 断言要验「真的落地」，不能只验「没报错」。**
+**④ 测试要能在没有 Xwayland 的环境跑。**
+CI 的 Arch 容器默认不带 Xwayland，sway 会报
+`Cannot find Xwayland binary`，X11 探针就起不来。
+探针只是**观测手段**，不是被测功能 —— 起不来就跳过依赖它的断言，
+而不是让整个测试失败。真正验证「输入到达应用」的是第 5~7 节，
+用的是原生 Wayland 终端（alacritty），不需要 X11。
+
+本地装 `xorg-xwayland` 能跑满 22 项；CI 里装了会跑满，
+万一镜像没装也能跑 18 项且不误报。
+
+**⑤ 断言要验「真的落地」，不能只验「没报错」。**
 最早的客户端库测试只检查「截图还能取」，结果是假阳性 —— 中文根本没进去
 也照样通过。现在一律用「起一个 `cat > 文件` 的终端，读文件内容」来验。
 
