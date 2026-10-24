@@ -310,26 +310,72 @@ static void input_init(struct capture *c) {
  *   实测（WAYLAND_DEBUG）确认请求格式无误，所以只能改用 motion(dx,dy) 累积定位。
  *
  * 坐标约定：vx/vy 是 0..65535 的归一化值，W/H 是输出尺寸。 */
-static int g_cur_x, g_cur_y;      /* 我们以为光标在哪（像素） */
-
-static void inject_move(int vx, int vy, int W, int H) {
-    if (!cap.ptr || W <= 0 || H <= 0) return;
-    int tx = (int)((long long)vx * W / 65535);
-    int ty = (int)((long long)vy * H / 65535);
-    if (tx >= W) tx = W - 1;
-    if (ty >= H) ty = H - 1;
-    int dx = tx - g_cur_x, dy = ty - g_cur_y;
-    if (dx == 0 && dy == 0) return;
-    zwlr_virtual_pointer_v1_motion(cap.ptr, now_ms(),
-        wl_fixed_from_int(dx), wl_fixed_from_int(dy));
+/* 光标定位。
+ *
+ * ⚠️ 这里从「相对位移累积」改成了 motion_absolute，原因是一个实测出来的 bug：
+ *   相对位移的实现是 `dx = 目标 - 我们以为的当前位置`，而「当前位置」的初值
+ *   被假定为 (0,0)。**合成器重启后光标并不在 (0,0)** —— 实测初始在 (99,99)，
+ *   于是每次点击都偏移 (99,99)：点 (1067,360) 实际落在 (1166,459)。
+ *   这种偏移还会随操作累积，表现为「点不准、越点越偏」。
+ *
+ *   改成 absolute 后不再依赖任何「当前位置」的假设，直接把归一化坐标和
+ *   输出尺寸交给合成器。sway 完整实现了 motion_absolute（labwc 不支持，
+ *   真要在 labwc 上跑，见 docs/PROTOCOLS.md 的降级说明）。
+ *
+ * ⚠️ 协议里的 x/y 是**像素坐标**，不是 0..65535 归一化值。协议原文：
+ *      "Value of x can range from 0 to x_extent, value of y can range from 0 to y_extent."
+ *    一开始想当然按 0..65535 传，结果坐标全部超出 extent 被钳到边缘，
+ *    表现为「光标只会在角落、点击位置全错」。实测对照：
+ *      motion_absolute(640,360, 1280,720) → 探针收到 (638,358)  ✅ 差 2px 是窗口边框
+ *      motion_absolute(32000,32000, 1280,720) → 无任何移动        ❌ 超范围
+ *
+ * 所以前端仍发 0..65535（与画面尺寸无关，缩放窗口也不会错），
+ * 在这里换算成像素。 */
+static void inject_move(int vx, int vy, int eW, int eH) {
+    if (!cap.ptr || eW <= 0 || eH <= 0) return;
+    if (vx < 0) vx = 0;
+    if (vy < 0) vy = 0;
+    if (vx > 65535) vx = 65535;
+    if (vy > 65535) vy = 65535;
+    /* 归一化 → 像素，并夹到 [0, extent-1] */
+    int tx = (int)((long long)vx * eW / 65535);
+    int ty = (int)((long long)vy * eH / 65535);
+    if (tx >= eW) tx = eW - 1;
+    if (ty >= eH) ty = eH - 1;
+    if (tx < 0) tx = 0;
+    if (ty < 0) ty = 0;
+    zwlr_virtual_pointer_v1_motion_absolute(cap.ptr, now_ms(),
+        (uint32_t)tx, (uint32_t)ty, (uint32_t)eW, (uint32_t)eH);
     zwlr_virtual_pointer_v1_frame(cap.ptr);
     wl_display_flush(cap.display);
-    g_cur_x = tx; g_cur_y = ty;
+}
+
+/* 按钮码映射。
+ *
+ * ⚠️ 协议要的是 **Linux input-event-codes 里的 BTN_***（0x110 起），
+ *   不是前端那种「1=左 2=中 3=右」的习惯编号。直接把 1/2/3 发过去，
+ *   合成器会当成 BTN_LEFT 之外的怪键 —— 实测 X11 客户端收到的是
+ *   button=104 / 96 / 197 这种垃圾值，点击自然没反应。
+ *
+ * 前端仍发 1/2/3（网页习惯），在这里翻译：
+ *   1 → BTN_LEFT(0x110)  2 → BTN_MIDDLE(0x112)  3 → BTN_RIGHT(0x111)
+ * 也接受直接给 0x110 这类标准码，方便脚本直接用。
+ */
+static uint32_t map_button(uint32_t b) {
+    switch (b) {
+    case 1: return 0x110;   /* BTN_LEFT */
+    case 2: return 0x112;   /* BTN_MIDDLE */
+    case 3: return 0x111;   /* BTN_RIGHT */
+    case 4: return 0x113;   /* BTN_SIDE */
+    case 5: return 0x114;   /* BTN_EXTRA */
+    default: return b;      /* 已经是标准码 */
+    }
 }
 
 static void inject_button(uint32_t btn, uint32_t down) {
     if (!cap.ptr) return;
-    zwlr_virtual_pointer_v1_button(cap.ptr, now_ms(), btn, down ? 1 : 0);
+    uint32_t code = map_button(btn);
+    zwlr_virtual_pointer_v1_button(cap.ptr, now_ms(), code, down ? 1 : 0);
     zwlr_virtual_pointer_v1_frame(cap.ptr);
     wl_display_flush(cap.display);
 }
@@ -418,6 +464,169 @@ static void inject_key(uint32_t code, uint32_t down) {
      * 只 flush，主线程看到 g_input_dirty 会补一次 roundtrip。 */
     wl_display_flush(cap.display);
     g_input_dirty = 1;
+}
+
+/* ---------- ASCII → evdev 键码（服务端自己的表，供文本注入用） ---------- */
+
+/* 返回 evdev 扫描码；0 = 该字符没有对应键 */
+static uint32_t ascii_to_evdev(int c) {
+    static const uint8_t lower[26] = {
+        30,48,46,32,18,33,34,35,23,36,37,38,50,49,24,25,16,19,31,20,22,47,17,45,21,44
+    };
+    static const uint8_t digits[10] = { 11,2,3,4,5,6,7,8,9,10 };
+    if (c >= 'a' && c <= 'z') return lower[c - 'a'];
+    if (c >= 'A' && c <= 'Z') return lower[c - 'A'];
+    if (c >= '0' && c <= '9') return digits[c - '0'];
+    switch (c) {
+    case ' ':  return 57;
+    case '\n': return 28;
+    case '\t': return 15;
+    case '-':  return 12;  case '_': return 12;
+    case '=':  return 13;  case '+': return 13;
+    case '[':  return 26;  case '{': return 26;
+    case ']':  return 27;  case '}': return 27;
+    case '\\': return 43;  case '|': return 43;
+    case ';':  return 39;  case ':': return 39;
+    case '\'': return 40;  case '"': return 40;
+    case '`':  return 41;  case '~': return 41;
+    case ',':  return 51;  case '<': return 51;
+    case '.':  return 52;  case '>': return 52;
+    case '/':  return 53;  case '?': return 53;
+    case '!':  return 2;   case '@': return 3;   case '#': return 4;
+    case '$':  return 5;   case '%': return 6;   case '^': return 7;
+    case '&':  return 8;   case '*': return 9;   case '(': return 10;
+    case ')':  return 11;
+    default:   return 0;
+    }
+}
+
+/* 该 ASCII 字符是否需要 Shift（大写字母 / 上档符号） */
+static int ascii_needs_shift(int c) {
+    if (c >= 'A' && c <= 'Z') return 1;
+    switch (c) {
+    case '!': case '@': case '#': case '$': case '%': case '^':
+    case '&': case '*': case '(': case ')':
+    case '_': case '+': case '{': case '}': case '|': case ':':
+    case '"': case '~': case '<': case '>': case '?':
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* ---------- 任意 Unicode 字符注入（中文 / emoji / 任意符号） ----------
+ *
+ * 为什么不能靠 evdev 键码：键盘布局里根本没有「中」这个键。要打非 ASCII，
+ * 唯一可行的路子是**临时换一张只含该字符的 keymap**，再按对应的键码。
+ * 这也是 wtype 的做法（实测抓到的 keymap 原文）：
+ *
+ *     xkb_keycodes "(unnamed)" { minimum = 8; maximum = 10; <K1> = 9; };
+ *     xkb_symbols  "(unnamed)" { key <K1> {[U4E2D]}; };      // U4E2D = 「中」
+ *
+ * `UXXXX` 是 xkb 的 Unicode keysym 写法，合成器会把它交给客户端当作文本。
+ *
+ * ⚠️ 顺序仍然是 keymap → key，且必须一个 roundtrip 让 keymap 先落地。
+ * ⚠️ 用完必须把完整的 evdev keymap 推回去（push_keymap_snapshot），
+ *    否则后续普通按键会落到这张「只有一个键」的表上，全部失效。
+ *    这是 wtype 的已知毛病，我们不能重犯。
+ *
+ * 返回 0 成功，-1 失败。调用方在**主线程**（需要 roundtrip）。 */
+static int inject_unicode_codepoint(uint32_t cp) {
+    if (!cap.kbd || cp == 0 || cp > 0x10FFFF) return -1;
+    /* 代理区不是合法码点 */
+    if (cp >= 0xD800 && cp <= 0xDFFF) return -1;
+
+    /* 键码固定用 evdev 1（xkb keycode 9），与 wtype 一致。
+     * keycodes 段声明 minimum/maximum 只覆盖这一个键，避免残留其它键位。 */
+    char km[512];
+    int len = snprintf(km, sizeof km,
+        "xkb_keymap {\n"
+        "xkb_keycodes \"(unnamed)\" { minimum = 8; maximum = 10; <K1> = 9; };\n"
+        "xkb_types \"(unnamed)\" { include \"complete\" };\n"
+        "xkb_compatibility \"(unnamed)\" { include \"complete\" };\n"
+        "xkb_symbols \"(unnamed)\" { key <K1> {[U%04X]}; };\n"
+        "};\n", cp);
+    if (len <= 0 || (size_t)len >= sizeof km) return -1;
+
+    int fd = memfd_create("wstream-uni", MFD_CLOEXEC);
+    if (fd < 0) return -1;
+    if (ftruncate(fd, (off_t)len) != 0) { close(fd); return -1; }
+    void *m = mmap(NULL, (size_t)len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) { close(fd); return -1; }
+    memcpy(m, km, (size_t)len);
+    munmap(m, (size_t)len);
+    zwp_virtual_keyboard_v1_keymap(cap.kbd, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
+                                   fd, (uint32_t)len);
+    close(fd);
+    /* keymap 必须先被合成器处理完，key 才有意义 */
+    wl_display_roundtrip(cap.display);
+
+    /* 按一下这个键。code=1 是 evdev 扫描码，合成器内部 +8 → xkb 9。 */
+    zwp_virtual_keyboard_v1_key(cap.kbd, now_ms(), 1, 1);
+    zwp_virtual_keyboard_v1_key(cap.kbd, now_ms(), 1, 0);
+    wl_display_flush(cap.display);
+    return 0;
+}
+
+/* 解一个 UTF-8 字符，返回码点并推进 *pp；非法序列返回 0xFFFD 并只前进 1 字节 */
+static uint32_t utf8_next(const uint8_t **pp, const uint8_t *end) {
+    const uint8_t *p = *pp;
+    if (p >= end) return 0;
+    uint8_t c = *p;
+    if (c < 0x80) { *pp = p + 1; return c; }
+
+    int extra; uint32_t cp;
+    if      ((c & 0xE0) == 0xC0) { extra = 1; cp = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07; }
+    else { *pp = p + 1; return 0xFFFD; }
+
+    if (p + extra >= end) { *pp = p + 1; return 0xFFFD; }
+    for (int i = 1; i <= extra; i++) {
+        if ((p[i] & 0xC0) != 0x80) { *pp = p + 1; return 0xFFFD; }
+        cp = (cp << 6) | (p[i] & 0x3F);
+    }
+    *pp = p + extra + 1;
+    return cp;
+}
+
+/* 注入一整段 UTF-8 文本。**只在主线程调用**（内部会 roundtrip）。
+ * 返回实际注入的字符数。 */
+static int inject_text(const char *s, size_t n) {
+    if (!cap.kbd) return 0;
+    const uint8_t *p = (const uint8_t *)s, *end = p + n;
+    int count = 0;
+    while (p < end) {
+        uint32_t cp = utf8_next(&p, end);
+        if (cp == 0 || cp == 0xFFFD) continue;
+        /* 换行/制表符用普通键更可靠（很多应用对 U000A 不响应） */
+        if (cp == '\n') { inject_key(28, 1); inject_key(28, 0); count++; continue; }
+        if (cp == '\t') { inject_key(15, 1); inject_key(15, 0); count++; continue; }
+        /* 纯 ASCII 走原来的键码路径：更快，且不折腾 keymap */
+        if (cp < 0x80) {
+            uint32_t code = ascii_to_evdev((int)cp);
+            if (code) {
+                int shift = ascii_needs_shift((int)cp);
+                if (shift) inject_key(42, 1);
+                inject_key(code, 1);
+                inject_key(code, 0);
+                if (shift) inject_key(42, 0);
+                count++;
+                continue;
+            }
+            /* 没有键码的 ASCII（少见）也走 Unicode 路径 */
+        }
+        if (inject_unicode_codepoint(cp) == 0) count++;
+        /* 每个字符之间留一点时间，否则终端会丢字 */
+        struct timespec ts = {0, 12 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+    /* ⚠️ 关键收尾：把完整 evdev keymap 推回去，否则后续普通按键全失效 */
+    if (count > 0) {
+        push_keymap_snapshot(&cap, 0);
+        wl_display_roundtrip(cap.display);
+    }
+    return count;
 }
 
 /* 把一个 BGRX 帧存成 PPM：没有浏览器时也能核对画面正确性 */
@@ -524,6 +733,26 @@ static int nclients;
 static unsigned long g_client_id;   /* 只在持锁时递增 */
 static pthread_mutex_t g_cl_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* ---------- 输入所有权 ----------
+ *
+ * 多客户端同时连的时候，如果谁都能注入，鼠标会互相拉扯：A 把光标移到左边、
+ * B 同时移到右边，结果两边都觉得「点了没反应」。所以同一时刻**只允许一个
+ * 客户端持有输入权**。
+ *
+ * 规则（类似 VNC 的单控制器模型）：
+ *   - 第一个发来 type 6 do_take 的客户端成为持有者
+ *   - 持有者断开 → 自动释放，谁先抢谁得
+ *   - 显式 type 6 do_release → 释放
+ *   - **非持有者的输入事件一律丢弃**（这是关键：在前端隐藏按钮不够，
+ *     必须服务端强制，否则随便一个脚本都能绕过）
+ *
+ * g_owner 是 client id（0 = 无人持有）。读写都要持 g_cl_mu。 */
+static unsigned long g_owner;
+
+/* 当前调用者是不是输入持有者。ws_read 在持锁状态下调用。 */
+static int is_owner(unsigned long id) { return id != 0 && id == g_owner; }
+
+
 /* 按 id 反查槽位。-1 = 已不存在。**调用方必须持有 g_cl_mu。**
  *
  * 为什么要 id 而不是下标：poll() 前记下标、poll() 回来后按下标访问，
@@ -564,6 +793,11 @@ static int send_all(int fd, const void *buf, size_t len) {
 /* **调用方必须持有 g_cl_mu。** */
 static void drop_client(int i) {
     if (g_verbose) logf_("[-] 客户端断开 (stream=%d ws=%d)", clients[i].is_stream, clients[i].is_ws);
+    /* 持有者走了就把输入权释放掉，否则沙箱会一直没人能操作 */
+    if (clients[i].id && clients[i].id == g_owner) {
+        g_owner = 0;
+        logf_("🔓 输入持有者断开，已释放控制权");
+    }
     if (clients[i].fd >= 0) close(clients[i].fd);
     clients[i] = clients[nclients - 1];
     nclients--;
@@ -582,14 +816,15 @@ static const char INDEX_HTML[] =
     "border:1px solid #fff;border-radius:50%;box-shadow:0 0 4px #000,inset 0 0 3px #000;display:none}\n"
     "#bar{margin:11px;letter-spacing:.06em;font-size:11px;text-transform:uppercase}\n"
     "#bar b{color:#4ade80;font-weight:600}\n"
-    "#k{position:absolute;left:-9999px;opacity:0}\n"
+    "#k{position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;"
+    "border:0;padding:0;background:transparent;color:transparent;pointer-events:none}\n"
     "#hint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;"
     "background:#0009;color:#fff;font-size:14px;letter-spacing:.1em;cursor:pointer;"
     "text-transform:uppercase;backdrop-filter:blur(2px)}\n"
     "</style></head><body>\n"
     "<div id=wrap><img id=v src=\"/stream.mjpg\"><div id=cur></div>"
     "<div id=hint>点击画面开始操作</div></div>\n"
-    "<div id=bar>agent sandbox · <b id=st>连接中…</b> · 点画面接管 · Ctrl+Esc 释放</div>\n"
+    "<div id=bar>agent sandbox · <b id=st>连接中…</b> · 点画面接管（同一时刻只有一人能操作）· Ctrl+Esc 释放</div>\n"
     "<input id=k autocomplete=off spellcheck=false>\n"
     "<script>\n"
     "const v=document.getElementById('v'),cur=document.getElementById('cur'),st=document.getElementById('st'),\n"
@@ -615,6 +850,16 @@ static const char INDEX_HTML[] =
     "  const bf=new ArrayBuffer(8),dv=new DataView(bf);\n"
     "  dv.setUint8(0,type);dv.setUint8(1,0);dv.setUint16(2,0,true);\n"
     "  dv.setInt16(4,a|0,true);dv.setInt16(6,b|0,true);\n"
+    "  ws.send(bf);\n"
+    "}\n"
+    "/* type 5：8 字节头 + UTF-8 负载。中文/emoji 等非 ASCII 走这条。\n"
+    " * 服务端收到后换 keymap 注入，见 inject_text()。 */\n"
+    "function sendText(t){\n"
+    "  if(!ws||ws.readyState!==1||!t)return;\n"
+    "  const enc=new TextEncoder().encode(t);\n"
+    "  const bf=new Uint8Array(8+enc.length);\n"
+    "  bf[0]=5;\n"
+    "  bf.set(enc,8);\n"
     "  ws.send(bf);\n"
     "}\n"
     "/* ---------- 画面坐标 → 虚拟坐标 ---------- */\n"
@@ -649,24 +894,56 @@ static const char INDEX_HTML[] =
     "  const c=(e.key||'').toUpperCase().charCodeAt(0);\n"
     "  return M[c]||0;\n"
     "}\n"
+    "/* IME 组合中：此时按键是「拼音输入过程」，绝不能当普通键发出去，\n"
+    " * 否则会把 pinyin 字母也打进沙箱。等 compositionend 拿到最终文本再发。 */\n"
+    "let composing=false;\n"
+    "k.addEventListener('compositionstart',()=>{composing=true;});\n"
+    "k.addEventListener('compositionend',e=>{\n"
+    "  composing=false;\n"
+    "  if(!active)return;\n"
+    "  if(e.data)sendText(e.data);   /* 中文/日文等由 IME 产出的最终文本 */\n"
+    "  k.value='';\n"
+    "});\n"
     "k.addEventListener('keydown',e=>{\n"
     "  if(!active)return;\n"
     "  if(e.key==='Escape'&&e.ctrlKey){e.preventDefault();release();return;}\n"
+    "  if(composing)return;              /* 交给 IME，不要抢 */\n"
+    "  /* 粘贴：Ctrl+V / Cmd+V 由 paste 事件处理，这里吞掉避免重复 */\n"
+    "  if((e.ctrlKey||e.metaKey)&&(e.key==='v'||e.key==='V')){e.preventDefault();return;}\n"
     "  e.preventDefault();\n"
     "  const c=evdev(e);if(!c)return;\n"
     "  if(!e.repeat)send(4,c,1);\n"
     "});\n"
     "k.addEventListener('keyup',e=>{\n"
-    "  if(!active)return;e.preventDefault();\n"
+    "  if(!active||composing)return;e.preventDefault();\n"
     "  const c=evdev(e);if(c)send(4,c,0);\n"
+    "});\n"
+    "/* 粘贴：整段文本原样送过去，中文/多行都没问题 */\n"
+    "k.addEventListener('paste',e=>{\n"
+    "  if(!active)return;\n"
+    "  e.preventDefault();\n"
+    "  const t=(e.clipboardData||window.clipboardData).getData('text');\n"
+    "  if(t)sendText(t);\n"
+    "  k.value='';\n"
+    "});\n"
+    "/* 兜底：万一 input 事件拿到了非 ASCII（部分浏览器 IME 行为不一致），\n"
+    " * 也送过去；纯 ASCII 忽略，避免和 keydown 重复。 */\n"
+    "k.addEventListener('input',e=>{\n"
+    "  if(!active||composing)return;\n"
+    "  const t=e.target.value||'';\n"
+    "  if(!t)return;\n"
+    "  if(/[^\\x00-\\x7F]/.test(t))sendText(t);\n"
+    "  k.value='';\n"
     "});\n"
     "/* ---------- 接管 / 释放 ---------- */\n"
     "function take(){active=true;hint.style.display='none';cur.style.display='block';\n"
     "  v.style.cursor='none';st.textContent='已接管 · 可操作沙箱';k.focus();\n"
+    "  send(6,1,0);   /* type 6 = 输入权控制，action 1 = take */\n"
     "  const p=pos({clientX:v.getBoundingClientRect().left+50,clientY:v.getBoundingClientRect().top+50});\n"
     "  send(1,p[0],p[1]);}\n"
     "function release(){active=false;hint.style.display='flex';cur.style.display='none';\n"
-    "  v.style.cursor='crosshair';st.textContent='已释放 · 但你仍可正常使用自己电脑';k.blur();}\n"
+    "  v.style.cursor='crosshair';st.textContent='已释放 · 但你仍可正常使用自己电脑';k.blur();\n"
+    "  send(6,0,0);   /* action 0 = release */}\n"
     "hint.addEventListener('click',take);\n"
     "v.addEventListener('click',()=>{if(!active)take();});\n"
     "img_ready();\n"
@@ -832,10 +1109,96 @@ static int ws_handshake(int fd, const char *req) {
     return 0;
 }
 
-/* 把 WS 帧负载交给注入器；返回 0 表示正常 */
-static void handle_msg(const uint8_t *m, size_t n) {
+/* ---------- 文本注入队列 ----------
+ *
+ * type 5（文本）不能像鼠标/键盘那样在网络线程里直接注入：inject_text() 内部要
+ * 换 keymap + roundtrip，而 Wayland 只允许主线程 dispatch。
+ * 所以网络线程把文本塞进队列，主线程在抓帧循环里取出来执行。
+ *
+ * 用固定大小的环形缓冲 + 互斥锁。单条上限 4KB；满了就丢弃并记日志
+ * （宁可丢，也不要让网络线程阻塞住 —— 那会把整个 HTTP 服务拖死）。 */
+#define TEXT_Q_SLOTS 8
+#define TEXT_Q_MAX   4096
+
+static struct {
+    char buf[TEXT_Q_SLOTS][TEXT_Q_MAX];
+    size_t len[TEXT_Q_SLOTS];
+    int head, tail, count;
+} g_tq;
+static pthread_mutex_t g_tq_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* 网络线程调用。返回 0 = 入队成功，-1 = 队列满/超长 */
+static int text_enqueue(const char *s, size_t n) {
+    if (n == 0 || n >= TEXT_Q_MAX) return -1;
+    int ok = -1;
+    pthread_mutex_lock(&g_tq_mu);
+    if (g_tq.count < TEXT_Q_SLOTS) {
+        memcpy(g_tq.buf[g_tq.tail], s, n);
+        g_tq.len[g_tq.tail] = n;
+        g_tq.tail = (g_tq.tail + 1) % TEXT_Q_SLOTS;
+        g_tq.count++;
+        ok = 0;
+    }
+    pthread_mutex_unlock(&g_tq_mu);
+    return ok;
+}
+
+/* 主线程调用：取一条出来（拷贝走），返回长度，0 = 队列空 */
+static size_t text_dequeue(char *out, size_t cap) {
+    size_t n = 0;
+    pthread_mutex_lock(&g_tq_mu);
+    if (g_tq.count > 0) {
+        n = g_tq.len[g_tq.head];
+        if (n >= cap) n = cap - 1;
+        memcpy(out, g_tq.buf[g_tq.head], n);
+        out[n] = 0;
+        g_tq.head = (g_tq.head + 1) % TEXT_Q_SLOTS;
+        g_tq.count--;
+    }
+    pthread_mutex_unlock(&g_tq_mu);
+    return n;
+}
+
+/* 把 WS 帧负载交给注入器。
+ * caller_id = 发送者 client id，**调用方必须持有 g_cl_mu**（要读 g_owner）。 */
+static void handle_msg(unsigned long caller_id, const uint8_t *m, size_t n) {
     if (n < 8) return;
     uint8_t type = m[0];
+
+    /* ---------- 控制帧（不受所有权限制） ---------- */
+    if (type == 6) {
+        /* action 取 A 字段（byte 4-5），与前端 send(6, action, 0) 对齐。
+         * ⚠️ 不能读 m[1]：那是 flags 位，前端恒为 0，会把 take 当成 release。 */
+        uint8_t action = m[4];   /* 0 = release, 1 = take */
+        if (action == 1) {
+            if (g_owner && g_owner != caller_id) {
+                /* 抢占：把控制权转给新来的人。前排用户可能已经关页面了，
+                 * 硬锁着不放会导致「谁都操作不了」。 */
+                logf_("🔁 输入权转移：%lu → %lu", g_owner, caller_id);
+            }
+            g_owner = caller_id;
+            logf_("🔒 客户端 %lu 取得输入权", caller_id);
+        } else if (g_owner == caller_id) {
+            g_owner = 0;
+            logf_("🔓 客户端 %lu 释放输入权", caller_id);
+        }
+        return;
+    }
+
+    /* ---------- 输入帧：必须持有输入权 ---------- */
+    /* ⚠️ 在前端隐藏按钮是不够的：任何脚本都能直接连 /ws 发帧。
+     * 服务端强制「非持有者的输入一律丢弃」才是真的隔离。 */
+    if (!is_owner(caller_id)) {
+        static uint32_t last_warn;
+        uint32_t t = now_ms();
+        if (t - last_warn > 3000) {   /* 限流，避免刷屏 */
+            last_warn = t;
+            logf_("⛔ 忽略无输入权的客户端 %lu 的输入事件（当前持有者=%lu）",
+                  caller_id, g_owner);
+        }
+        return;
+    }
+
     /* 两种解释都要有，按 type 分开用 —— 这是之前「鼠标只有左半边能点」的根因：
      *   鼠标坐标 (type 1) 是 **无符号** 16 位，范围 0..65535；
      *   滚动步数 (type 3) 是 **有符号** 的（负数 = 向下滚）。
@@ -850,6 +1213,14 @@ static void handle_msg(const uint8_t *m, size_t n) {
     case 2: inject_button((uint32_t)ua, (uint32_t)(sb != 0)); break;
     case 3: inject_scroll(sa); break;
     case 4: inject_key((uint32_t)ua, (uint32_t)(sb != 0)); break;
+    case 5:
+        /* type 5 文本：8 字节头 + UTF-8 负载（byte 8 起）。
+         * 交给主线程注入（见 text_enqueue 的说明）。 */
+        if (n > 8) {
+            if (text_enqueue((const char *)m + 8, n - 8) == 0) g_input_dirty = 1;
+            else logf_("⚠️ 文本队列满或超长，丢弃 %zu 字节", n - 8);
+        }
+        break;
     default: break;
     }
 }
@@ -890,7 +1261,7 @@ static size_t ws_parse_one(struct client *cl) {
 
     (void)fin;
     if (opcode == 2) {                                   /* 二进制：输入事件 */
-        handle_msg(payload, (size_t)plen);
+        handle_msg(cl->id, payload, (size_t)plen);
     } else if (opcode == 8) {                            /* close */
         return (size_t)-2;
     }
@@ -1144,10 +1515,19 @@ int main(int argc, char **argv) {
                 g_run = 0; break;
             }
             /* 网络线程刚注入了输入：由主线程统一 roundtrip，
-             * 既把事件推给合成器，也把随之而来的回调处理掉。 */
+             * 既把事件推给合成器，也把随之而来的回调处理掉。
+             *
+             * 同时把排队的文本取出来注入 —— inject_text() 需要 roundtrip，
+             * 只能在这里（主线程）做。一次最多处理一条，避免长时间占住循环。 */
             if (g_input_dirty) {
                 g_input_dirty = 0;
                 wl_display_roundtrip(cap.display);
+                char txt[TEXT_Q_MAX];
+                size_t tn = text_dequeue(txt, sizeof txt);
+                if (tn > 0) {
+                    int got = inject_text(txt, tn);
+                    if (g_verbose) logf_("⌨️ 文本注入 %d 字符 / %zu 字节", got, tn);
+                }
                 continue;
             }
             /* 这一分支不能省：poll 超时也要 dispatch_pending，否则已到队列的事件

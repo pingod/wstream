@@ -21,7 +21,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed \
             git gcc pkgconf wayland libjpeg-turbo libxkbcommon \
-            wlr-protocols sway grim
+            wlr-protocols sway grim libx11 alacritty python
 
       - name: 环境自检
         run: |
@@ -78,6 +78,20 @@ jobs:
 
           ./scripts/start.sh stop
 
+      - name: 键鼠注入回归测试
+        run: |
+          set -x
+          # 这个测试会自己起沙箱，所以前面那份已经停掉了
+          ./scripts/start.sh 1280x720
+
+          # X11 探针：把收到的按键/鼠标事件按行打印，供精确断言
+          gcc -O1 -Wall -Wextra -o tests/x11probe tests/x11probe.c \
+              $(pkg-config --cflags --libs x11)
+
+          python3 tests/wstest.py
+
+          ./scripts/start.sh stop
+
       - name: 失败时打印日志
         if: failure()
         run: |
@@ -87,6 +101,10 @@ jobs:
           cat /tmp/wstream/wstream.log 2>/dev/null || echo "(无)"
           echo "──── 沙箱内进程 ────"
           pgrep -af alacritty 2>/dev/null || echo "(无 alacritty)"
+          echo "──── X11 探针日志 ────"
+          cat /tmp/x11probe.log 2>/dev/null || echo "(无)"
+          echo "──── 沙箱终端输出 ────"
+          cat /tmp/wstream_typed.txt 2>/dev/null || echo "(无)"
 
       - name: 上传快照
         if: always()

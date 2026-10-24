@@ -163,14 +163,37 @@ static void inject_move(int vx, int vy, int W, int H) {
 }
 ```
 
-### 坐标范围
+### 坐标范围（⚠️ 这里是像素，不是归一化值）
 
-`motion_absolute` 的 `x/y` 是 **uint32**，`x_extent/y_extent` 是输出尺寸：
+协议原文：`Value of x can range from 0 to x_extent`。所以 `x/y` 是**像素坐标**：
 
 ```c
+/* ✅ 正确：像素坐标 */
 zwlr_virtual_pointer_v1_motion_absolute(ptr, time,
-    32767, 36408,    /* x, y：0..65535 归一化 */
-    1280, 720);      /* x_extent, y_extent：实际像素尺寸 */
+    640, 360,        /* x, y：像素，范围 0..extent */
+    1280, 720);      /* x_extent, y_extent：输出尺寸 */
+
+/* ❌ 错误：按 0..65535 归一化传 → 超出 extent，被钳到边缘 */
+zwlr_virtual_pointer_v1_motion_absolute(ptr, time, 32000, 32000, 1280, 720);
+```
+
+实测对照（X11 探针收到的 MOTION）：
+
+| 发送 | 收到 |
+|---|---|
+| `motion_absolute(640, 360, 1280, 720)` | `MOTION x=638 y=358` ✅ |
+| `motion_absolute(32000, 32000, 1280, 720)` | 无任何移动 ❌ |
+
+前端仍发 0..65535（与画面缩放解耦），服务端 `inject_move` 里换算成像素。
+
+### 按钮码是 BTN_*，不是 1/2/3
+
+```c
+/* ❌ 直接发 1/2/3：客户端收到 button=104/96/197 这种垃圾值 */
+/* ✅ 用 Linux input-event-codes */
+zwlr_virtual_pointer_v1_button(ptr, time, 0x110, 1);   /* BTN_LEFT */
+zwlr_virtual_pointer_v1_button(ptr, time, 0x112, 1);   /* BTN_MIDDLE */
+zwlr_virtual_pointer_v1_button(ptr, time, 0x111, 1);   /* BTN_RIGHT */
 ```
 
 ---
@@ -248,6 +271,30 @@ zwp_virtual_keyboard_v1_modifiers(kbd, mods, 0, 0, 0);
 
 ---
 
+### 任意 Unicode 字符（中文 / emoji）
+
+键盘布局里没有「中」，只能**临时换一张只含该字符的 keymap**：
+
+```c
+/* 1. 生成只含一个 Unicode keysym 的表 */
+"xkb_keycodes \"(unnamed)\" { minimum = 8; maximum = 10; <K1> = 9; };\n"
+"xkb_symbols  \"(unnamed)\" { key <K1> {[U4E2D]}; };\n"   /* U4E2D = 「中」 */
+
+/* 2. 推给合成器 → roundtrip 等它生效 → 按 keycode 1（xkb 9） */
+
+/* 3. ⚠️ 立刻把完整 evdev keymap 推回去，否则后续普通按键全失效 */
+```
+
+`U%04X` 是 xkb 的 Unicode keysym 写法（等价于 `0x01000000 + codepoint`）。
+
+实测细节：
+- 顺序必须 keymap → key，中间要 roundtrip
+- 每个字符之间留 ~12ms，否则终端会丢字
+- **Xwayland 不认这套**：它有自己独立的 keymap，keycode 9 永远是 Escape
+  （探针实测收到 `sym=0xff1b`）
+
+---
+
 ## 五、HTTP / WebSocket
 
 ### 为什么不用现成库
@@ -314,6 +361,17 @@ Origin // 带了就必须是本页来源；不带则放行（curl/脚本）
 见 [README 的通信协议章节](../README.md#通信协议)。
 
 **核心要点：8 字节定长，小端序，A/B 的符号性随 type 变化。**
+
+其中两条是变长/控制的例外：
+
+| type | 结构 | 说明 |
+|---|---|---|
+| 5 文本 | 8 字节头 + UTF-8 负载 | 头里 A/B 都填 0，真实数据从 byte 8 起 |
+| 6 控制 | 8 字节，A=action | 1=取输入权，0=释放；不携带输入数据 |
+
+⚠️ 读 type 6 的 action 要取 **A 字段（byte 4）**，不是 byte 1。
+byte 1 是 flags 位，前端恒为 0 —— 读错的话「取权」会被当成「释放」，
+表现为怎么点都操作不了。
 
 ---
 

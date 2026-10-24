@@ -9,6 +9,9 @@
 # wayland-scanner 生成
 /proto/
 
+# 测试构建产物
+/tests/x11probe
+
 # 编辑器
 .vscode/
 .idea/

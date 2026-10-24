@@ -319,6 +319,30 @@ sway 用 `wayland-{N}`，N 是递增的。如果之前有残留实例，新起�
 | 音频 | 加 PipeWire 线程，前端加 `<audio>` |
 | 剪贴板同步 | `inject_*` 旁边加 `wl_data_device` 处理 |
 | 多显示器 | `struct capture` 改成数组，抓多个 output |
-| 鉴权 | `http_thread` 的 accept 后加 token 校验 |
+| 鉴权 | `http_thread` 的 accept 后加 token 校验（已有 Origin/Host 校验） |
 | TLS | 加 OpenSSL 包装 socket |
 | 窗口级抓取 | 换成 `ext-image-copy-capture-v1` 协议 |
+
+### 已经实现的扩展点（1.1.0）
+
+| 功能 | 实现在哪 | 设计要点 |
+|---|---|---|
+| Unicode/中文输入 | `inject_text` + `inject_unicode_codepoint` | 网络线程只入队（`g_tq`），主线程取出来注入 —— 因为要 roundtrip |
+| 输入所有权 | `g_owner` + `is_owner()` | **服务端强制**，非持有者的输入直接丢；前端隐藏按钮挡不住脚本 |
+| 回归测试 | `tests/wstest.py` | 断言「事件到达应用」，不看截图（截图会因终端刷新而不稳） |
+
+### 文本注入为什么必须过队列
+
+`inject_text()` 要给合成器推新 keymap 并 `roundtrip`，而 Wayland 只允许
+**一个线程** dispatch。所以：
+
+```
+网络线程                       主线程（抓帧循环）
+────────                       ──────────────────
+handle_msg(type=5)             if (g_input_dirty)
+  → text_enqueue()  ──────►      → text_dequeue()
+  → g_input_dirty=1              → inject_text()  ← 这里才 roundtrip
+```
+
+队列是固定 8 槽、单条上限 4KB 的环形缓冲。满了就**丢弃并记日志**，
+绝不能让网络线程阻塞 —— 那会把整个 HTTP 服务拖死。

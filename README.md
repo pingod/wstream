@@ -69,6 +69,8 @@ wstream 的思路是：**给 agent 一个完全独立的虚拟桌面**。
 | **零窗口** | 不往用户桌面创建任何窗口，不抢焦点 |
 | **实时画面** | MJPEG 流，浏览器 `<img>` 原生支持，无需 JS 解码 |
 | **双向交互** | 鼠标移动/点击/滚轮 + 完整键盘（含 Ctrl/Shift/Alt/Super 组合键） |
+| **中文 / 任意 Unicode** | IME 输入、粘贴、emoji 都能进沙箱（走 keymap 重映射） |
+| **多人围观不打架** | 同一时刻只有一个人能操作，其余人只读；控制权可转移 |
 | **纯 C** | 单文件 ~1100 行，无运行时依赖（除 3 个系统库） |
 | **低开销** | 推流进程 CPU ~0.1%，带宽 ~0.16 MB/s @10fps |
 | **零配置** | `./scripts/start.sh` 一条命令起全套 |
@@ -258,10 +260,47 @@ Content-Length: 81234
 | `2` 鼠标按键 | button（1=左 2=中 3=右） | state（1=按下 0=抬起） | |
 | `3` 滚轮 | steps（**int16**，负数=向下） | 0 | |
 | `4` 键盘 | evdev code | state（1=按下 0=抬起） | |
+| `5` **文本** | 0 | 0 | 8 字节头 + UTF-8 负载（byte 8 起），中文/emoji 走这条 |
+| `6` **控制** | action（1=取权 0=释放） | 0 | 输入所有权 |
 
 > ⚠️ **A/B 的符号性随 type 变化**：坐标是无符号 16 位（0..65535），
 > 滚动步数是有符号 16 位。服务端必须按 type 分开解释，否则屏幕右半边
 > （x > 32767）会被解成负数而完全点不动。这个 bug 真实存在过，见[踩过的坑](#踩过的坑)。
+
+### 中文 / 任意 Unicode（type 5）
+
+键盘布局里没有「中」这个键，所以非 ASCII 不能靠键码。做法是**临时换一张
+只含该字符的 keymap**，按一下再换回来：
+
+```
+xkb_keycodes "(unnamed)" { minimum = 8; maximum = 10; <K1> = 9; };
+xkb_symbols  "(unnamed)" { key <K1> {[U4E2D]}; };   // U4E2D = 「中」
+```
+
+`UXXXX` 是 xkb 的 Unicode keysym 写法。要点：
+
+- 顺序必须 **keymap → key**，中间要有一次 roundtrip
+- **用完必须把完整 evdev keymap 推回去**，否则后续普通按键全落到那张
+  只有一个键的表上（wtype 就有这个毛病）
+- 只对**原生 Wayland 客户端**有效；Xwayland 有独立 keymap，keycode 9 在
+  它那里永远是 Escape
+
+前端支持三种来源：IME 的 `compositionend`、粘贴事件、非 ASCII 的 `input` 兜底。
+IME 组合期间（`compositionstart` 之后）的按键会被忽略，否则拼音字母也会被敲进去。
+
+### 输入所有权（type 6）
+
+多个浏览器同时连时，如果谁都能注入，鼠标会互相拉扯。规则：
+
+```
+第一个发 type 6 action=1 的客户端 → 成为持有者
+持有者断开                        → 自动释放
+显式发 action=0                   → 释放
+非持有者的输入                    → 服务端直接丢弃
+```
+
+> ⚠️ **必须服务端强制。** 只在前端隐藏按钮是不够的——任何脚本都能直接连
+> `/ws` 发帧，绕过界面。
 
 ### 键盘映射
 
@@ -393,7 +432,27 @@ wl_display_dispatch_queue: Assertion 'ret == -1 || ret > 0' failed
 如果 `input_init` 里忘了 `create_virtual_pointer`，`cap.ptr` 永远是 `NULL`，
 所有鼠标事件静默丢弃——**而日志还骗人地说「虚拟指针已就绪」**。
 
-### 12. `motion_absolute` 不是所有合成器都实现
+### 12. `motion_absolute` 的 x/y 是**像素**，不是 0..65535
+
+协议原文是 `Value of x can range from 0 to x_extent`。按归一化传，
+坐标全被钳到边缘 → **光标只会在角落、点哪都不对**。
+
+### 13. 不要依赖「光标初始位置」这种隐式状态
+
+早期用相对位移累积，`g_cur` 初值假定 (0,0)。但合成器重启后光标在 (99,99)，
+于是**每次点击都偏移 99px，越点越偏**。现在改用 `motion_absolute`，不依赖任何状态。
+
+### 14. 按钮码要 `BTN_LEFT`，不是 1/2/3
+
+`zwlr_virtual_pointer_v1.button` 要的是 Linux input-event-codes 的 `BTN_*`
+（0x110 起）。直接发 1/2/3，客户端收到 `button=104/96/197` 这种垃圾值，点击无效。
+
+### 15. XWayland **不是**「抓不到也注不进去」
+
+1.0.0 的文档写错了。实测：X11 窗口能被抓进画面、能被点击、能收到 ASCII 键盘。
+只有中文受限（keycode 9 冲突）。
+
+### 16. `motion_absolute` 不是所有合成器都实现
 
 labwc 只接了 `wlr_seat_pointer_notify_motion`（相对位移），
 `motion_absolute` 请求发得完全正确（`WAYLAND_DEBUG` 可验证），但**静默丢弃**。
@@ -406,7 +465,7 @@ WAYLAND_DEBUG=client ./wstream -p 8765 2>&1 | grep -E "motion|button"
 
 如果能看到请求发出但光标不动 → 合成器不支持。**换 sway。**
 
-### 13. `start.sh` 里的 socket 名不能写死
+### 17. `start.sh` 里的 socket 名不能写死
 
 sway 的 socket 不一定是 `wayland-0`（多实例时会是 `wayland-1`）。
 必须动态探测：
@@ -415,7 +474,7 @@ sway 的 socket 不一定是 `wayland-0`（多实例时会是 `wayland-1`）。
 WL=$(basename "$(ls "$ROOT"/run/wayland-* 2>/dev/null | head -1)")
 ```
 
-### 14. sway 没有 labwc 的 `-S` 启动钩子
+### 18. sway 没有 labwc 的 `-S` 启动钩子
 
 labwc 支持 `labwc -S script.sh`，sway 只能用配置文件里的 `exec`：
 
@@ -423,7 +482,7 @@ labwc 支持 `labwc -S script.sh`，sway 只能用配置文件里的 `exec`：
 exec /path/to/desktop.sh
 ```
 
-### 15. `pkill -f xxx` 会杀掉自己的 shell
+### 19. `pkill -f xxx` 会杀掉自己的 shell
 
 因为 bash 的命令行里也包含那个字符串。用 `pgrep -x`（精确匹配进程名）更安全。
 
@@ -433,9 +492,9 @@ exec /path/to/desktop.sh
 
 | 限制 | 说明 | 可能的解法 |
 |---|---|---|
-| **只能操作原生 Wayland 客户端** | XWayland 窗口走另一条合成路径，抓不到也注不进去 | 需要额外实现 X11 输入注入 |
+| **XWayland 里打不了中文** | keycode 9 在 Xwayland 的 keymap 里是 Escape。**键鼠本身可用**（1.0.0 说「抓不到也注不进去」是错的，实测可抓帧、可点击、可打 ASCII） | 走剪贴板粘贴 |
 | **无音频** | 只传画面 | 加 PipeWire 抓音频 |
-| **单客户端体验** | 多浏览器同时看会有竞争 | 加连接管理 |
+| **同一时刻只能一人操作** | 有输入所有权机制，其余人只读 | 已实现，见下方“输入所有权” |
 | **无剪贴板同步** | 沙箱与宿主机剪贴板不通 | 加 `wl_data_device` 桥接 |
 | **打不了非 ASCII（中文等）** | 没有 IME，前端只做 `keyCode → evdev` 映射 | 在 WS 协议里加「正文/剪贴板直传」通道 |
 | **仅 Linux / wlroots 系** | 依赖 `wlr-screencopy` 和 `zwlr_virtual_pointer` | Hyprland 的 headless 后端受限于 aquamarine 缺软件渲染 |

@@ -107,6 +107,35 @@ def move(s, x, y, W=1280, H=720):
 
 def click(s, button=1):
     send(s, 2, button, 1); time.sleep(0.04); send(s, 2, button, 0)
+
+# ⚠️ 1.1.0 起必须**先取输入权**，否则所有输入会被服务端丢弃
+def take(s):      # 取得操作权（同一时刻只有一个人能操作）
+    send(s, 6, 1, 0); time.sleep(0.15)
+
+def release(s):   # 用完释放，让别人也能操作
+    send(s, 6, 0, 0)
+
+# 中文 / emoji：8 字节头 + UTF-8 负载（type 5）
+def type_text_raw(s, text):
+    payload = bytes([5,0,0,0]) + struct.pack('<HH', 0, 0) + text.encode('utf-8')
+    m = os.urandom(4); n = len(payload)
+    hdr = (bytes([0x82, 0x80|n]) if n < 126
+           else bytes([0x82, 0x80|126]) + struct.pack('>H', n))
+    s.sendall(hdr + m + bytes(c ^ m[i % 4] for i, c in enumerate(payload)))
+    time.sleep(0.05)
+```
+
+**最小可用流程**：
+
+```python
+s = ws_connect()
+take(s)                    # ← 别忘
+move(s, 640, 360, 1280, 720)
+click(s)
+type_text(s, "echo hi")    # ASCII，逐键
+send(s, 4, 28, 1); send(s, 4, 28, 0)   # Enter
+type_text_raw(s, "中文也能打")
+release(s)
 ```
 
 **键盘用 evdev 扫描码**，常用映射：
@@ -223,6 +252,9 @@ hyprctl cursorpos
 | 只有左半边能点 | 坐标按 int16 读了 | 见 `docs/HANDOFF.md` 坑 3 |
 | 打字乱码（a→l） | 键码多加了 8 | 见 `docs/HANDOFF.md` 坑 1 |
 | 打字完全无反应 | WS 帧不是 8 字节 | 见 `docs/HANDOFF.md` 坑 2 |
+| **所有输入都没反应** | 没取输入权（type 6 action=1） | 先 `take(s)`，见坑 7 相关 |
+| **点哪里都不准** | `motion_absolute` 坐标要像素不是归一化 | 见坑 8；脚本用 `move()` 即可 |
+| **点击没反应** | 按钮码要 BTN_LEFT(0x110) | 见坑 10 |
 | 握手回 403 | `Host`/`Origin` 不是本机来源 | 用 `Host: 127.0.0.1:8765`，别带外站 `Origin`，见坑 6 |
 | 服务随机崩 / 越界 | `clients[]` 跨 poll 用下标 | 见 `docs/HANDOFF.md` 坑 7 |
 | 窗口跑到用户桌面上 | 没 `env -u DISPLAY` | 见 `docs/HANDOFF.md` 坑 5 |
@@ -238,7 +270,7 @@ hyprctl cursorpos
 |---|---|
 | **XWayland 程序注不进去** | firefox / Electron 默认走 X11，wstream 只能操作原生 Wayland 客户端。要让它们走 Wayland：加 `MOZ_ENABLE_WAYLAND=1`（firefox）或 `--ozone-platform=wayland`（Electron/Chromium） |
 | 只能本机访问 | 只监听 `127.0.0.1`；已校验 `Host`/`Origin`，但无 token、无 TLS |
-| **打不了中文/非 ASCII** | 逐键注入 + 无 IME。要输入中文只能走剪贴板（尚未实现） |
+| **Xwayland 里打不了中文** | keycode 9 在 Xwayland 的 keymap 里是 Escape。键鼠本身可用 |
 | 无音频 | 只传画面 |
 | 无剪贴板同步 | 沙箱与宿主机剪贴板不通 |
 | 仅 wlroots 系合成器 | sway / labwc 可以；Hyprland 的 headless 后端受限于 aquamarine |
