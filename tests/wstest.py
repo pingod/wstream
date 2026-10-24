@@ -427,6 +427,33 @@ def main():
         # 确认焦点真的回到探针了（BUTTON 数增加说明点击到达）
         check("点击能把焦点切回探针", "BUTTON" in probe_output(log))
 
+        print("── 6b. 修饰键释放（防 Shift 卡住）──")
+        # ⚠️ 这个断言是补盲区的：之前 21 项测试没测「大写字母」，
+        # 结果 keymap 每次重推把修饰位清零、Shift 释放时不发 modifiers，
+        # 打 "Upper" 会变成 "UPPER" —— 只有专门测大小写才会暴露。
+        out_before = probe_output(log)
+        n_before = out_before.count("KEY ")
+        # Shift+a 应产生大写 A；随后单独打 b 应是小写
+        ws_send(s, 4, 42, 1)      # Shift down
+        ws_send(s, 4, 30, 1)      # a
+        ws_send(s, 4, 30, 0)
+        ws_send(s, 4, 42, 0)      # Shift up
+        time.sleep(0.4)
+        ws_send(s, 4, 48, 1)      # b（此时 Shift 必须已释放）
+        ws_send(s, 4, 48, 0)
+        ws_send(s, 4, 28, 1)
+        ws_send(s, 4, 28, 0)
+        time.sleep(0.8)
+        out_after = probe_output(log)[len(out_before):] if n_before else probe_output(log)
+        # 断言：Shift 释放后，b 的 state 里不应带 Shift 位（0x1）
+        b_lines = [l for l in out_after.splitlines() if l.startswith("KEY b")]
+        shift_stuck = any("state=0x1" in l or "state=0x11" in l for l in b_lines) if b_lines else False
+        check("Shift 释放后不粘连", not shift_stuck,
+              f"(b 的事件={b_lines})")
+        # Shift+a 在 X11 探针那边解析成大写 "KEY A"（sym=0x41），这是正确行为
+        check("Shift+a 打出大写 A", "KEY A" in out_after, f"(片段={out_after[:120]!r})")
+        check("之后的 b 是小写", "KEY b" in out_after, f"(片段={out_after[:120]!r})")
+
         print("── 7. 多客户端所有权 ──")
         s2 = ws_connect()
         time.sleep(0.2)

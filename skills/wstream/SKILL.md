@@ -62,7 +62,33 @@ sudo pacman -S --needed gcc pkgconf wayland libjpeg-turbo libxkbcommon \
 
 有两种方式，**优先用第一种**。
 
-### 方式 A：通过 WebSocket 注入（推荐，可脚本化）
+### 方式 A0：用客户端库（**最推荐**）
+
+仓库自带 `clients/wstream_client.py`，零依赖，不用手工复制代码：
+
+```python
+import sys; sys.path.insert(0, "/path/to/wstream/clients")
+from wstream_client import WStream
+
+with WStream() as ws:
+    ws.wait_ready()                       # start.sh 刚返回时可能还没初始化完
+    ws.take()                             # ⚠️ 不调这个，所有输入都会被丢弃
+
+    for w in ws.windows():                # 知道该点哪里
+        print(w["app_id"], (w["cx"], w["cy"]))
+
+    ws.click_window("AgentTop")           # 点窗口中心
+    ws.type_text("echo hello")            # ASCII 逐键
+    ws.press("enter")
+    ws.type_any("中文内容")                # 含非 ASCII 自动走剪贴板
+    ws.press("enter")
+    ws.snapshot("/tmp/now.jpg")           # 取一张截图看图
+```
+
+API 速查见 `clients/README.md`。下面两种方式是它的底层实现，
+需要精细控制时再看。
+
+### 方式 A：通过 WebSocket 注入（底层，可脚本化）
 
 沙箱启动后，`ws://127.0.0.1:8765/ws` 接受 **8 字节二进制帧**（小端）：
 
@@ -294,7 +320,9 @@ hyprctl cursorpos
 | **点哪里都不准** | `motion_absolute` 坐标要像素不是归一化 | 见坑 8；脚本用 `move()` 即可 |
 | **点击没反应** | 按钮码要 BTN_LEFT(0x110) | 见坑 10 |
 | **页面读剪贴板超时** | type 7/8 被输入权拦了 / 主循环没查 g_clip_dirty | 见坑 15 |
-| **X11 程序里中文进不去** | 逐键到不了 XWayland | 改用剪贴板 + Ctrl+V |
+| **X11 程序里中文进不去** | 逐键到不了 XWayland | 改用剪贴板粘贴 |
+| **大写字母变成全大写** | 修饰键释放时没发 modifiers | 见坑 18 |
+| **Ctrl+V 没反应、多出字母 v** | 每键推 keymap 清零修饰位 / 终端要 Ctrl+Shift+V | 见坑 17、19 |
 | 握手回 403 | `Host`/`Origin` 不是本机来源 | 用 `Host: 127.0.0.1:8765`，别带外站 `Origin`，见坑 6 |
 | 服务随机崩 / 越界 | `clients[]` 跨 poll 用下标 | 见 `docs/HANDOFF.md` 坑 7 |
 | 窗口跑到用户桌面上 | 没 `env -u DISPLAY` | 见 `docs/HANDOFF.md` 坑 5 |
@@ -310,6 +338,7 @@ hyprctl cursorpos
 |---|---|
 | **XWayland 程序注不进去** | firefox / Electron 默认走 X11，wstream 只能操作原生 Wayland 客户端。要让它们走 Wayland：加 `MOZ_ENABLE_WAYLAND=1`（firefox）或 `--ozone-platform=wayland`（Electron/Chromium） |
 | 只能本机访问 | 只监听 `127.0.0.1`；已校验 `Host`/`Origin`，但无 token、无 TLS |
+| 有 `/snapshot.jpg` 和 `/windows` | 前者取单帧、后者查窗口坐标，不用装 grim |
 | Xwayland 里的中文 | 逐键到不了，但**走剪贴板可以**（type 7 + Ctrl+V） |
 | 无音频 | 只传画面 |
 | 无剪贴板同步 | 沙箱与宿主机剪贴板不通 |

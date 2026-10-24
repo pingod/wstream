@@ -38,6 +38,8 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/mman.h>
+#include <sys/un.h>
+#include <dirent.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -58,6 +60,22 @@
 static int g_verbose;
 static int g_quality = 70;
 static int g_fps = 10;
+/* keymap 新鲜度：
+ *   0 = 需要重推（刚被 Unicode 注入换掉、或初次）
+ *   1 = 我们推的完整 evdev 布局仍是当前生效的那张
+ *
+ * ⚠️ 为什么不能每键都推 keymap（2026-10-24 实测坐实）：
+ *   合成器收到新 keymap 会**重建键盘状态，修饰位被清零**。
+ *   每键都推的后果是 Ctrl+V 退化成傻按一个 v、Shift+v 出小写 v ——
+ *   1.1.0 为了「盖掉别的客户端留下的残缺 keymap」加了每键推送，
+ *   结果把组合键全弄坏了。这是个真实的回归，只有打大写/粘贴才会暴露。
+ *
+ * 现在的策略：正常只推一次，Unicode 注入后标脏、下次按键前重推。 */
+static int g_keymap_fresh;
+/* 上一次发给合成器的修饰位。用来判断「变了没」——
+ * 必须能发 0（全部释放），否则 Shift/Ctrl 会卡住（踩过）。 */
+static uint32_t g_mods_sent;
+
 static int g_port = 8765;   /* 用于 Origin 校验：只信任发往本端口的页面 */
 static volatile sig_atomic_t g_net_stop;   /* main 退出时通知网络线程收工 */
 
@@ -304,6 +322,7 @@ static void input_init(struct capture *c) {
         close(fd);
     }
     wl_display_flush(c->display);
+    g_keymap_fresh = 1;   /* input_init 里已经推过完整 evdev keymap */
     logf_("✅ 虚拟键盘%s已就绪（可交互）", c->ptr ? " + 虚拟指针" : "（鼠标不可用）");
 }
 
@@ -400,6 +419,8 @@ static void inject_scroll(int steps) {
 static uint32_t g_mods;
 static volatile int g_input_dirty;   /* 有输入事件待 roundtrip（只在主线程清） */
 
+
+
 /* 与 wtype 相同的做法：为「单个 evdev keycode」生成一张只含它的 keymap 并通过
  * memfd 传给合成器，紧贴在 key 事件之前。返回时 memfd 已关闭（合成器已 mmap）。 */
 /* 推送「完整的 evdev 布局」keymap。要点全是踩出来的：
@@ -447,18 +468,18 @@ static void inject_key(uint32_t code, uint32_t down) {
     else if (code == 56 || code == 100) mods = 8;  /* 左 Alt / 右 Alt → bit3 */
     else if (code == 125 || code == 126) mods = 64;/* 左 Meta / 右 Meta → bit6 */
 
+    /* 先算出新的修饰位状态，但**不要马上发** —— 见下面 push_keymap 之后的说明。 */
     if (mods) {
         if (down) g_mods |= mods; else g_mods &= ~mods;
-        zwp_virtual_keyboard_v1_modifiers(cap.kbd, g_mods, 0, 0, 0);
-    } else if (g_mods) {
-        zwp_virtual_keyboard_v1_modifiers(cap.kbd, g_mods, 0, 0, 0);
     }
-    /* 两个必须一起做的动作，顺序也不能反：
-     *   (1) 先推完整的 evdev 布局 keymap —— 多虚拟键盘并存时生效的是"最后推过来的
-     *       那份"，别人（wtype/wshowkeys）留下的单键位表会让我们的键码全部错位；
-     *   (2) 紧接着发 key。合成器一收到 keymap 就把它标成"已处理、可以按键"，
-     *       随后才处理 key 事件，所以 keymap 必须在 key 之前。 */
-    push_keymap_snapshot(&cap, code);
+    /* 只在 keymap 不新鲜时重推（初次 / Unicode 注入之后）。
+     * ⚠️ 不要每键都推：推 keymap 会清零修饰位，组合键直接失效。
+     * 详见 g_keymap_fresh 的说明。 */
+    if (!g_keymap_fresh) {
+        push_keymap_snapshot(&cap, code);
+        g_keymap_fresh = 1;
+        g_mods_sent = 0;   /* 新 keymap 会让合成器清掉修饰位，我们也要同步 */
+    }
     /* 🔑 这里是整个键盘问题真正的根因（2026-10-23 实测坐实）：
      *   zvp_virtual_keyboard_v1.key(code) 里的 code 是 **evdev 扫描码**，
      *   wlroots 收到后自己 +8 得到 xkb keycode（evdev 30 = 'a' → xkb 38）。
@@ -467,6 +488,19 @@ static void inject_key(uint32_t code, uint32_t down) {
      *   屏幕上的现象正好是 abc 打成 "l]c"，b 打成 "m"，与实测逐字节吻合。
      *   另一路证据：最小复现程序不 +8 时永远正确，一 +8 立刻错乱。
      *   所以：直接发 code，绝不加 8。 */
+    /* ⚠️ modifiers 必须在 push_keymap **之后**发（2026-10-24 实测坐实）。
+     * 推新 keymap 会让合成器重建键盘状态，修饰位被清零。如果在推 keymap
+     * 之前发 modifiers，组合键就失效：Ctrl+V 变成傻按一个 v ——
+     * 实测现象是「剪贴板里明明是中文，终端里却多出一个字母 v」。
+     * 顺序必须是：keymap → modifiers → key。 */
+    /* ⚠️ 必须「变了就发」，不能只在 g_mods 非零时发。
+     * 踩过：`if (g_mods)` 导致修饰键全部释放时（g_mods 归 0）**不发** modifiers，
+     * 合成器就一直以为 Shift 是按下的 —— 现象是打 "Upper" 得到 "UPPER"。
+     * 所以比较「上次发出去的值」，不同才发（避免每键都发，但该发的一定发）。 */
+    if (g_mods != g_mods_sent) {
+        zwp_virtual_keyboard_v1_modifiers(cap.kbd, g_mods, 0, 0, 0);
+        g_mods_sent = g_mods;
+    }
     zwp_virtual_keyboard_v1_key(cap.kbd, now_ms(), code, down ? 1 : 0);
     /* 注入发生在网络线程，不能在这里 roundtrip（主线程才 dispatch）。
      * 只 flush，主线程看到 g_input_dirty 会补一次 roundtrip。 */
@@ -684,6 +718,7 @@ static const struct zwlr_data_control_device_v1_listener dc_dev_listener = {
 static void src_send(void *data, struct zwlr_data_control_source_v1 *src,
                      const char *mime, int32_t fd) {
     (void)data; (void)src;
+    if (g_verbose) logf_("📤 有人来取剪贴板：mime=%s", mime);
     /* 不管它要什么 mime，都给同一份 UTF-8 文本 */
     if (!strncmp(mime, "text/", 5) || !strcmp(mime, "UTF8_STRING") ||
         !strcmp(mime, "STRING") || !strcmp(mime, "TEXT")) {
@@ -869,6 +904,8 @@ static int inject_text(const char *s, size_t n) {
     /* ⚠️ 关键收尾：把完整 evdev keymap 推回去，否则后续普通按键全失效 */
     if (count > 0) {
         push_keymap_snapshot(&cap, 0);
+        g_keymap_fresh = 1;
+        g_mods_sent = 0;
         wl_display_roundtrip(cap.display);
     }
     return count;
@@ -1346,6 +1383,129 @@ static void push_clipboard(unsigned long req_id) {
 
 /* 有没有人在看画面。主线程用它决定这一帧要不要编码 —— 必须走锁，
  * 否则读到的是网络线程正在改的 nclients（数据竞争，UB）。 */
+/* ---------- 按需快照（GET /snapshot.jpg） ----------
+ *
+ * 场景：agent 想知道「现在屏幕长什么样」，只想拿一张图。
+ * 之前只能 ① 用 `-s` 重启一个 wstream（会中断推流）② 装 grim。
+ * 都不合适，加个 HTTP 端点。
+ *
+ * 线程问题：抓帧在主线程，HTTP 在网络线程。所以：
+ *   网络线程：置 want 标志 → 条件变量等 ← 主线程编码完唤醒
+ *   主线程：发现 want 就额外存一份 JPEG → 唤醒网络线程
+ *
+ * 编码只在「有人看流」或「有人要快照」时才做，闲时仍不耗 CPU。
+ * 等待上限 3 秒：合成器卡住时不能让 HTTP 线程永久阻塞。 */
+static pthread_mutex_t g_snap_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_snap_cv = PTHREAD_COND_INITIALIZER;
+static volatile int g_snap_want;      /* 网络线程置 1，表示有请求等着 */
+static unsigned     g_snap_gen;       /* 每次 publish +1 */
+static uint8_t     *g_snap_buf;
+static size_t       g_snap_len;
+static size_t       g_snap_cap;
+/* 最近一次编码出来的 JPEG（不管有没有人在看）。用于让连续/并发快照请求
+ * 直接命中缓存、不阻塞 accept 循环。
+ *
+ * 为什么需要：HTTP 的 accept 是**串行**的 —— 每个连接都要先 recv 请求、
+ * 再处理。如果每个 snapshot 都阻塞等下一帧（~100ms @10fps），20 个并发请求
+ * 就是 2 秒，listen backlog 直接溢出。有了新鲜缓存，第二个请求起就是零等待。 */
+static uint8_t     *g_last_jpg;
+static size_t       g_last_len;
+static size_t       g_last_cap;
+static uint32_t     g_last_ms;        /* 最近一次编码的时间戳 */
+
+/* 主线程调用：如果有人在等快照，把这一帧的 JPEG 存下来。 */
+static void snap_publish(const uint8_t *jpg, size_t len) {
+    if (!g_snap_want) return;
+    pthread_mutex_lock(&g_snap_mu);
+    if (g_snap_want) {
+        if (len > g_snap_cap) {
+            uint8_t *nb = realloc(g_snap_buf, len);
+            if (nb) { g_snap_buf = nb; g_snap_cap = len; }
+        }
+        if (len <= g_snap_cap) {
+            memcpy(g_snap_buf, jpg, len);
+            g_snap_len = len;
+            g_snap_gen++;
+            g_snap_want = 0;
+            pthread_cond_broadcast(&g_snap_cv);
+        }
+    }
+    pthread_mutex_unlock(&g_snap_mu);
+}
+
+/* 主线程在每次编码成功后调用：更新「最近一帧」缓存。 */
+static void snap_cache_last(const uint8_t *jpg, size_t len) {
+    pthread_mutex_lock(&g_snap_mu);
+    if (len > g_last_cap) {
+        uint8_t *nb = realloc(g_last_jpg, len);
+        if (nb) { g_last_jpg = nb; g_last_cap = len; }
+    }
+    if (len <= g_last_cap) {
+        memcpy(g_last_jpg, jpg, len);
+        g_last_len = len;
+        g_last_ms = now_ms();
+    }
+    pthread_mutex_unlock(&g_snap_mu);
+}
+
+/* 网络线程调用：请求一张快照并等它。
+ * 成功返回 1，并把数据**拷贝**到调用方给的缓冲（*out 由调用方 free）。
+ *
+ * ⚠️ 必须拷贝，不能直接返回内部指针：多个 HTTP 线程可能同时等，
+ * 而主线程下一次 publish 会覆盖同一块内存 —— 那就是「A 刚拿到指针、
+ * B 触发新快照把它覆盖了」的数据竞争。踩过：并发取快照偶尔拿到半张图。 */
+static int snap_wait(uint8_t **out, size_t *out_len) {
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += 3;
+
+    *out = NULL;
+    *out_len = 0;
+
+    pthread_mutex_lock(&g_snap_mu);
+    /* 快速路径：最近 800ms 内编码过一帧就直接给它，完全不用等。
+     * 800ms 的取值：@10fps 相当于最多 8 帧的容差，画面变化不会太旧；
+     * 同时足够覆盖「agent 连续取几张图」的间隔。 */
+    if (g_last_len > 0 && (uint32_t)(now_ms() - g_last_ms) < 800) {
+        uint8_t *copy = malloc(g_last_len);
+        if (copy) {
+            memcpy(copy, g_last_jpg, g_last_len);
+            *out = copy;
+            *out_len = g_last_len;
+            pthread_mutex_unlock(&g_snap_mu);
+            return 1;
+        }
+    }
+    if (!g_snap_buf) {
+        g_snap_buf = malloc(512 * 1024);
+        g_snap_cap = g_snap_buf ? 512 * 1024 : 0;
+    }
+    /* 用「版本号变了」判断，而不是布尔 ready。
+     * 为什么：多个 HTTP 线程可能同时等，用布尔标志时后来者会把 ready 清零，
+     * 先来的 waiter 就被漏掉、白等一轮。版本号只增不减，每个 waiter 记下
+     * 自己等待的起点，谁都不会被别人的重置影响。 */
+    unsigned start = g_snap_gen;
+    g_snap_want = 1;
+    while (g_snap_gen == start) {
+        if (pthread_cond_timedwait(&g_snap_cv, &g_snap_mu, &dl) != 0) {
+            g_snap_want = 0;
+            break;
+        }
+    }
+    int ok = 0;
+    if (g_snap_gen != start && g_snap_len > 0) {
+        uint8_t *copy = malloc(g_snap_len);
+        if (copy) {
+            memcpy(copy, g_snap_buf, g_snap_len);
+            *out = copy;
+            *out_len = g_snap_len;
+            ok = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_snap_mu);
+    return ok;
+}
+
 static int has_viewers(void) {
     pthread_mutex_lock(&g_cl_mu);
     int n = nclients;
@@ -1353,6 +1513,325 @@ static int has_viewers(void) {
     return n > 0;
 }
 
+
+/* ---------- 窗口列表（GET /windows） ----------
+ *
+ * 为什么 agent 需要这个：知道「现在有哪些窗口、各在屏幕的哪里」，
+ * 才知道该往哪个坐标点击。只靠截图猜位置既慢又不可靠。
+ *
+ * 为什么不用 zwlr_foreign_toplevel_management：
+ *   它只给 title / app_id，**不给坐标**（set_rectangle 是给任务栏的提示，
+ *   不是真实位置）。而坐标恰恰是我们要的。
+ *
+ * 所以直接读 sway 的 IPC（沙箱里本来就跑着 sway）。
+ * sway 的 i3-ipc 协议很简单：magic "i3-ipc" + len + type，GET_TREE=4。
+ * 返回的 JSON 里每个容器带 rect 和 app_id/title。
+ *
+ * 这样做的前提：沙箱用的是 sway（start.sh 就是）。换成别的合成器时
+ * 这个端点返回 501，不影响其它功能。 */
+#define SWAY_IPC_GET_TREE 4
+
+/* 在 dir 里找 sway-ipc.*.sock。找不到返回 0。 */
+static int find_sway_sock(char *out, size_t cap, const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *de;
+    int found = 0;
+    while ((de = readdir(d))) {
+        if (!strncmp(de->d_name, "sway-ipc.", 9)) {
+            snprintf(out, cap, "%s/%s", dir, de->d_name);
+            found = 1;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+/* 通过 sway IPC 拿窗口树 JSON。成功返回 malloc 的字符串（调用方 free），失败 NULL。 */
+static char *sway_get_tree(void) {
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    char path[512];
+    if (!rt || !find_sway_sock(path, sizeof path, rt)) {
+        /* 退化：试 wstream 的默认根目录 */
+        if (!find_sway_sock(path, sizeof path, "/tmp/wstream/run")) return NULL;
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return NULL;
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX;
+    /* 显式长度检查：sun_path 只有 108 字节，超长会被 snprintf 静默截断，
+     * 那样 connect 会连到错的路径。宁可直接失败。 */
+    size_t plen_path = strlen(path);
+    if (plen_path >= sizeof sa.sun_path) { close(fd); return NULL; }
+    memcpy(sa.sun_path, path, plen_path + 1);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) { close(fd); return NULL; }
+
+    const char *cmd = "GET_TREE";
+    uint32_t len = 7, type = SWAY_IPC_GET_TREE;
+    char hdr[14];
+    memcpy(hdr, "i3-ipc", 6);
+    memcpy(hdr + 6, &len, 4);
+    memcpy(hdr + 10, &type, 4);
+    if (send_all(fd, hdr, 14) < 0 || send_all(fd, cmd, len) < 0) { close(fd); return NULL; }
+
+    /* 响应：14 字节头 + payload */
+    char rh[14];
+    size_t got = 0;
+    while (got < 14) {
+        ssize_t n = recv(fd, rh + got, 14 - got, 0);
+        if (n <= 0) { close(fd); return NULL; }
+        got += (size_t)n;
+    }
+    if (memcmp(rh, "i3-ipc", 6) != 0) { close(fd); return NULL; }
+    uint32_t plen;
+    memcpy(&plen, rh + 6, 4);
+    if (plen > 4 * 1024 * 1024) { close(fd); return NULL; }   /* 异常，别信 */
+    char *buf = malloc(plen + 1);
+    if (!buf) { close(fd); return NULL; }
+    got = 0;
+    while (got < plen) {
+        ssize_t n = recv(fd, buf + got, plen - got, 0);
+        if (n <= 0) { free(buf); close(fd); return NULL; }
+        got += (size_t)n;
+    }
+    buf[plen] = 0;
+    close(fd);
+    return buf;
+}
+
+/* ---------- 极简 JSON 扫描器 ----------
+ *
+ * 项目刻意零依赖，所以不引 cJSON。但字符串 strstr 的做法不可行 ——
+ * sway 的 JSON 里 rect 在 app_id **之前**，而且节点是嵌套的，
+ * 按「app_id 之后找 rect」会错位（踩过：两个窗口只认出 1 个，坐标还串了）。
+ *
+ * 这里写一个最小但正确的递归下降扫描器：只需要能遍历对象/数组、
+ * 读字符串和数字，找到「同时有 app_id 和 rect 的对象」。
+ * 不构建完整 DOM，边扫边判断，省内存。 */
+
+struct json_window {
+    char app_id[128];
+    char title[192];
+    int  x, y, w, h;
+    int  has_app, has_rect;
+};
+
+struct json_scan {
+    const char *p;
+    const char *end;
+    struct json_window *out;
+    int out_cap;
+    int out_n;
+    /* 当前对象收集到的字段 */
+    struct json_window cur;
+    int depth;
+};
+
+static void js_ws(struct json_scan *sc) {
+    while (sc->p < sc->end &&
+           (*sc->p == ' ' || *sc->p == '\t' || *sc->p == '\n' || *sc->p == '\r'))
+        sc->p++;
+}
+
+/* 读一个 JSON 字符串到 buf，处理常见转义。返回 0 成功。 */
+static int js_string(struct json_scan *sc, char *buf, size_t cap) {
+    js_ws(sc);
+    if (sc->p >= sc->end || *sc->p != '"') return -1;
+    sc->p++;
+    size_t n = 0;
+    while (sc->p < sc->end && *sc->p != '"') {
+        char c = *sc->p++;
+        if (c == '\\' && sc->p < sc->end) {
+            char e = *sc->p++;
+            switch (e) {
+            case 'n': c = '\n'; break;
+            case 't': c = '\t'; break;
+            case 'r': c = '\r'; break;
+            case 'b': c = '\b'; break;
+            case 'f': c = '\f'; break;
+            case 'u':   /* \uXXXX：这里不展开，简单跳过 4 位 */
+                for (int i = 0; i < 4 && sc->p < sc->end; i++) sc->p++;
+                c = '?';
+                break;
+            default: c = e; break;
+            }
+        }
+        if (n + 1 < cap) buf[n++] = c;
+    }
+    if (sc->p < sc->end) sc->p++;   /* 跳过结尾引号 */
+    buf[n] = 0;
+    return 0;
+}
+
+/* 读一个数字（也接受 null / true / false，返回 0 并给默认值） */
+static int js_number(struct json_scan *sc, int *out) {
+    js_ws(sc);
+    int neg = 0;
+    if (sc->p < sc->end && *sc->p == '-') { neg = 1; sc->p++; }
+    if (sc->p >= sc->end || *sc->p < '0' || *sc->p > '9') {
+        /* 不是数字：跳过 token */
+        while (sc->p < sc->end && *sc->p != ',' && *sc->p != '}' && *sc->p != ']')
+            sc->p++;
+        return -1;
+    }
+    long v = 0;
+    while (sc->p < sc->end && *sc->p >= '0' && *sc->p <= '9') {
+        v = v * 10 + (*sc->p - '0');
+        if (v > 100000000) v = 100000000;   /* 防溢出 */
+        sc->p++;
+    }
+    /* 跳过小数/指数部分 */
+    while (sc->p < sc->end && ( (*sc->p >= '0' && *sc->p <= '9') ||
+            *sc->p == '.' || *sc->p == 'e' || *sc->p == 'E' ||
+            *sc->p == '+' || *sc->p == '-'))
+        sc->p++;
+    *out = (int)(neg ? -v : v);
+    return 0;
+}
+
+static void js_skip_value(struct json_scan *sc);
+
+/* 扫描一个对象。depth_limit 防止病态输入爆栈。 */
+static void js_object(struct json_scan *sc, int depth) {
+    if (depth > 64) return;
+    js_ws(sc);
+    if (sc->p >= sc->end || *sc->p != '{') return;
+    sc->p++;
+
+    struct json_window save = sc->cur;
+    sc->cur = (struct json_window){0};
+
+    for (;;) {
+        js_ws(sc);
+        if (sc->p >= sc->end) break;
+        if (*sc->p == '}') { sc->p++; break; }
+        if (*sc->p == ',') { sc->p++; continue; }
+
+        char key[64];
+        if (js_string(sc, key, sizeof key) != 0) { sc->p++; continue; }
+        js_ws(sc);
+        if (sc->p < sc->end && *sc->p == ':') sc->p++;
+        js_ws(sc);
+
+        if (!strcmp(key, "app_id")) {
+            if (sc->p < sc->end && *sc->p == '"') {
+                js_string(sc, sc->cur.app_id, sizeof sc->cur.app_id);
+                sc->cur.has_app = 1;
+            } else {
+                js_skip_value(sc);
+            }
+        } else if (!strcmp(key, "name")) {
+            if (sc->p < sc->end && *sc->p == '"')
+                js_string(sc, sc->cur.title, sizeof sc->cur.title);
+            else
+                js_skip_value(sc);
+        } else if (!strcmp(key, "rect")) {
+            js_ws(sc);
+            if (sc->p < sc->end && *sc->p == '{') {
+                sc->p++;
+                int x = 0, y = 0, w = 0, h = 0;
+                for (;;) {
+                    js_ws(sc);
+                    if (sc->p >= sc->end) break;
+                    if (*sc->p == '}') { sc->p++; break; }
+                    if (*sc->p == ',') { sc->p++; continue; }
+                    char rk[32];
+                    if (js_string(sc, rk, sizeof rk) != 0) { sc->p++; continue; }
+                    js_ws(sc);
+                    if (sc->p < sc->end && *sc->p == ':') sc->p++;
+                    int v = 0;
+                    if (js_number(sc, &v) != 0) continue;
+                    if (!strcmp(rk, "x")) x = v;
+                    else if (!strcmp(rk, "y")) y = v;
+                    else if (!strcmp(rk, "width")) w = v;
+                    else if (!strcmp(rk, "height")) h = v;
+                }
+                sc->cur.x = x; sc->cur.y = y;
+                sc->cur.w = w; sc->cur.h = h;
+                sc->cur.has_rect = 1;
+            } else {
+                js_skip_value(sc);
+            }
+        } else if (!strcmp(key, "nodes") || !strcmp(key, "floating_nodes")) {
+            /* 递归进子节点数组 */
+            js_ws(sc);
+            if (sc->p < sc->end && *sc->p == '[') {
+                sc->p++;
+                for (;;) {
+                    js_ws(sc);
+                    if (sc->p >= sc->end || *sc->p == ']') { if (sc->p < sc->end) sc->p++; break; }
+                    if (*sc->p == ',') { sc->p++; continue; }
+                    if (*sc->p == '{') js_object(sc, depth + 1);
+                    else js_skip_value(sc);
+                }
+            }
+        } else {
+            js_skip_value(sc);
+        }
+    }
+
+    /* 出对象：如果这个对象本身是个窗口，收下 */
+    if (sc->cur.has_app && sc->cur.has_rect && sc->cur.w > 0 && sc->cur.h > 0 &&
+        sc->out_n < sc->out_cap) {
+        sc->out[sc->out_n++] = sc->cur;
+    }
+    sc->cur = save;
+}
+
+static void js_skip_value(struct json_scan *sc) {
+    js_ws(sc);
+    if (sc->p >= sc->end) return;
+    char c = *sc->p;
+    if (c == '"') { char t[8]; js_string(sc, t, sizeof t); return; }
+    if (c == '{') { int d = 0; while (sc->p < sc->end) {
+            if (*sc->p == '{') d++; else if (*sc->p == '}') { d--; if (!d) { sc->p++; return; } }
+            sc->p++; } return; }
+    if (c == '[') { int d = 0; while (sc->p < sc->end) {
+            if (*sc->p == '[') d++; else if (*sc->p == ']') { d--; if (!d) { sc->p++; return; } }
+            sc->p++; } return; }
+    while (sc->p < sc->end && *sc->p != ',' && *sc->p != '}' && *sc->p != ']')
+        sc->p++;
+}
+
+/* 把窗口列表转成 JSON 输出 */
+static void sway_extract_windows(const char *json, char *out, size_t cap) {
+    struct json_window wins[32];
+    struct json_scan sc;
+    memset(&sc, 0, sizeof sc);
+    sc.p = json;
+    sc.end = json + strlen(json);
+    sc.out = wins;
+    sc.out_cap = 32;
+
+    js_ws(&sc);
+    if (sc.p < sc.end && *sc.p == '{') {
+        /* 顶层对象会递归进 nodes，最终把所有窗口收进 wins */
+        js_object(&sc, 0);
+    }
+
+    size_t o = 0;
+    o += (size_t)snprintf(out + o, cap - o, "{\"windows\":[");
+    for (int i = 0; i < sc.out_n && o + 400 < cap; i++) {
+        /* 转义 title */
+        char esc[512];
+        size_t eo = 0;
+        for (const char *q = wins[i].title; *q && eo + 3 < sizeof esc; q++) {
+            if (*q == '"' || *q == '\\') esc[eo++] = '\\';
+            if ((unsigned char)*q >= 0x20) esc[eo++] = *q;
+        }
+        esc[eo] = 0;
+        o += (size_t)snprintf(out + o, cap - o,
+            "%s{\"app_id\":\"%s\",\"title\":\"%s\",\"x\":%d,\"y\":%d,"
+            "\"width\":%d,\"height\":%d,\"cx\":%d,\"cy\":%d}",
+            i ? "," : "", wins[i].app_id, esc,
+            wins[i].x, wins[i].y, wins[i].w, wins[i].h,
+            wins[i].x + wins[i].w / 2, wins[i].y + wins[i].h / 2);
+    }
+    snprintf(out + o, cap - o, "]}");
+}
 
 /* ---------- 请求头工具 ---------- */
 
@@ -1769,7 +2248,62 @@ static void *http_thread(void *arg) {
                         serve_forbidden(cfd);
                         continue;
                     }
-                    if (strstr(req, "/stream.mjpg")) {
+                    if (strstr(req, "/windows")) {
+                        /* 返回沙箱里的窗口列表 + 精确坐标，agent 据此决定点哪里 */
+                        char *tree = sway_get_tree();
+                        if (!tree) {
+                            static const char b[] =
+                                "{\"error\":\"无法读取窗口树（沙箱不是 sway？）\"}\n";
+                            char h[192];
+                            int hn = snprintf(h, sizeof h,
+                                "HTTP/1.1 501 Not Implemented\r\n"
+                                "Content-Type: application/json; charset=utf-8\r\n"
+                                "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+                                sizeof b - 1);
+                            if (send_all(cfd, h, (size_t)hn) == 0)
+                                send_all(cfd, b, sizeof b - 1);
+                        } else {
+                            size_t jc = strlen(tree) + 4096;
+                            char *js = malloc(jc);
+                            if (js) {
+                                sway_extract_windows(tree, js, jc);
+                                char h[192];
+                                int hn = snprintf(h, sizeof h,
+                                    "HTTP/1.1 200 OK\r\n"
+                                    "Content-Type: application/json; charset=utf-8\r\n"
+                                    "Content-Length: %zu\r\nCache-Control: no-store\r\n"
+                                    "Connection: close\r\n\r\n", strlen(js));
+                                if (send_all(cfd, h, (size_t)hn) == 0)
+                                    send_all(cfd, js, strlen(js));
+                                free(js);
+                            }
+                            free(tree);
+                        }
+                        close(cfd);
+                    } else if (strstr(req, "/snapshot.jpg")) {
+                        /* 取一张实时快照，不需要订阅流、不需要重启进程 */
+                        uint8_t *jpg = NULL;
+                        size_t jl = 0;
+                        if (snap_wait(&jpg, &jl)) {
+                            char h[192];
+                            int hn = snprintf(h, sizeof h,
+                                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n"
+                                "Content-Length: %zu\r\nCache-Control: no-store\r\n"
+                                "Connection: close\r\n\r\n", jl);
+                            if (send_all(cfd, h, (size_t)hn) == 0)
+                                send_all(cfd, jpg, jl);
+                            free(jpg);
+                        } else {
+                            static const char b[] = "503 no frame yet\n";
+                            char h[192];
+                            int hn = snprintf(h, sizeof h,
+                                "HTTP/1.1 503 Service Unavailable\r\n"
+                                "Content-Type: text/plain\r\nContent-Length: %zu\r\n"
+                                "Connection: close\r\n\r\n", sizeof b - 1);
+                            if (send_all(cfd, h, (size_t)hn) == 0) send_all(cfd, b, sizeof b - 1);
+                        }
+                        close(cfd);
+                    } else if (strstr(req, "/stream.mjpg")) {
                         serve_stream(cfd);
                         pthread_mutex_lock(&g_cl_mu);
                         unsigned long id = client_add(cfd, 1, 0);
@@ -1883,7 +2417,7 @@ int main(int argc, char **argv) {
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);      /* 只本机可访问 */
     if (bind(srv, (struct sockaddr *)&sa, sizeof sa) < 0)
         die("bind 127.0.0.1:%d 失败: %s", port, strerror(errno));
-    if (listen(srv, 8) < 0) die("listen: %s", strerror(errno));
+    if (listen(srv, 64) < 0) die("listen: %s", strerror(errno));
     fcntl(srv, F_SETFL, fcntl(srv, F_GETFL) | O_NONBLOCK);
 
     logf_("──────────────────────────────────────────────");
@@ -1979,9 +2513,18 @@ int main(int argc, char **argv) {
 
         if (cap.frame_failed) {
             dropped++;
-        } else if (has_viewers()) {
+        } else if (has_viewers() || g_snap_want) {
+            /* 有人看流、或有人在等快照，都要编码 */
+            int need_snap = g_snap_want;
             unsigned long jlen = jpeg_encode(&enc, fb[cur].addr, W, H);
-            if (jlen > 0) push_frame(enc.buf, jlen);
+            if (jlen > 0) {
+                snap_cache_last(enc.buf, jlen);   /* 给快照端点兜底 */
+                if (need_snap) snap_publish(enc.buf, jlen);
+                if (has_viewers()) push_frame(enc.buf, jlen);
+            } else if (need_snap) {
+                /* 编码失败也要唤醒，否则 HTTP 线程白等 3 秒 */
+                snap_publish(NULL, 0);
+            }
         }
         /* -s：抓一帧存 PPM 就退出 */
         if (ppm_out && !cap.frame_failed) {

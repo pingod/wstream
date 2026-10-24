@@ -330,6 +330,8 @@ sway 用 `wayland-{N}`，N 是递增的。如果之前有残留实例，新起�
 | 输入所有权 | `g_owner` + `is_owner()` | **服务端强制**，非持有者的输入直接丢；前端隐藏按钮挡不住脚本 |
 | 剪贴板同步 | `clipboard_init` / `clipboard_set` / `clipboard_get` | 用 data-control（不要焦点）；另有独立队列 `g_cq`，同样因为要 roundtrip |
 | 回归测试 | `tests/wstest.py` | 断言「事件到达应用」，不看截图（截图会因终端刷新而不稳） |
+| 快照端点 | `snap_wait` / `snap_publish` / `snap_cache_last` | 主线程抓帧、网络线程等，用版本号协调；带 800ms 缓存避免阻塞 accept |
+| 窗口列表 | `sway_get_tree` + `js_object` | 走 sway IPC（foreign-toplevel 不给坐标）；自带最小 JSON 扫描器，零依赖 |
 
 ### 剪贴板的数据流
 

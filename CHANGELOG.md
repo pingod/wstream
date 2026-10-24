@@ -2,6 +2,61 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.3.0] - 2026-10-24
+
+补齐 agent 实际使用时最缺的三样东西：能看、能定位、能复用。
+
+### 新增：`GET /snapshot.jpg`
+
+之前 agent 想看画面，只能 ① 用 `-s` 重启一个 wstream（会中断推流）
+② 装 grim。都不合适。
+
+现在一个 HTTP 请求就拿到 JPEG。带 **800ms 缓存**：连续/并发请求直接命中缓存，
+不阻塞 accept 循环（实测 20 路并发全部返回完整 JPEG）。
+
+### 新增：`GET /windows`
+
+返回沙箱里的窗口列表和**精确坐标**，agent 据此知道该点哪里：
+
+```json
+{"windows":[{"app_id":"AgentTop","title":"Alacritty@CachyOS",
+             "x":0,"y":0,"width":640,"height":720,"cx":320,"cy":360}]}
+```
+
+**为什么不用 `zwlr_foreign_toplevel_management`**：那个协议只给 title/app_id，
+**不给坐标**（set_rectangle 是给任务栏的提示，不是真实位置）。而坐标恰恰是要的。
+所以直接读 sway 的 i3-ipc `GET_TREE`（沙箱里本来就跑着 sway）。
+
+JSON 解析没引第三方库（项目刻意零依赖），写了个最小递归下降扫描器。
+一开始用 strstr 硬找，但 sway 的 JSON 里 `rect` 在 `app_id` **之前**、
+节点又是嵌套的，按「app_id 之后找 rect」会错位 —— 实测两个窗口只认出 1 个
+且坐标串了。换成正经扫描器后与 `swaymsg` 输出完全一致。
+
+### 新增：`clients/wstream_client.py`
+
+可 import 的 Python 客户端，把 SKILL.md 里要手工复制的 117 行代码变成模块。
+零依赖（只用标准库）。
+
+### 修复：两个只有测大小写/粘贴才会暴露的真 bug
+
+| # | 现象 | 原因 |
+|---|---|---|
+| A | `Upper` 打成 `UPPER`（Shift 卡住） | 每键都推 keymap，合成器重建键盘状态时把修饰位清零。1.1.0 为「盖掉别的客户端留下的残缺 keymap」加的每键推送，把组合键全弄坏了 |
+| B | Ctrl+V 没反应、只多出字母 `v` | 修饰键全释放时（g_mods 归 0）不发 modifiers，合成器一直以为 Shift 按着 |
+
+为什么之前 24 项测试没发现：**没有一条测过大写字母或粘贴**。
+现在补了断言（`Shift+a` 必须出大写 A、随后 `b` 必须是小写）。
+
+顺带确认：终端里粘贴是 **Ctrl+Shift+V**，`Ctrl+V` 是「引号转义」。
+客户端库 `paste()` 默认用前者。
+
+### 验证
+
+- 回归测试 24 项全过（新增快照/窗口/修饰键）
+- ASan + UBSan 下压测：4 路 WS 反复连断 + 并发快照 + 并发窗口列表 + MJPEG 流，
+  无 sanitizer 报告，进程存活
+- `clients/` 端到端测试全过：ASCII/中文/大写全部验证「真的落到终端」
+
 ## [1.2.0] - 2026-10-24
 
 剪贴板双向同步。顺带解决了「XWayland 里打不了中文」这个 1.1.0 遗留限制。

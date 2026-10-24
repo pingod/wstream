@@ -72,6 +72,7 @@ wstream 的思路是：**给 agent 一个完全独立的虚拟桌面**。
 | **中文 / 任意 Unicode** | IME 输入、粘贴、emoji 都能进沙箱（走 keymap 重映射） |
 | **多人围观不打架** | 同一时刻只有一个人能操作，其余人只读；控制权可转移 |
 | **剪贴板双向同步** | 沙箱复制 → 页面能拿到；页面粘贴 → 沙箱能收到（走 data-control） |
+| **给 agent 的 API** | `GET /snapshot.jpg` 取单帧、`GET /windows` 查窗口坐标、可 import 的 Python 客户端 |
 | **纯 C** | 单文件 ~1100 行，无运行时依赖（除 3 个系统库） |
 | **低开销** | 推流进程 CPU ~0.1%，带宽 ~0.16 MB/s @10fps |
 | **零配置** | `./scripts/start.sh` 一条命令起全套 |
@@ -240,6 +241,29 @@ Content-Length: 81234
 ```
 
 浏览器 `<img src="/stream.mjpg">` 原生支持，**零 JavaScript 解码开销**。
+
+### 端点一览
+
+| 端点 | 用途 | 谁用 |
+|---|---|---|
+| `GET /` | 交互页面（内嵌单页） | 浏览器 |
+| `GET /stream.mjpg` | MJPEG 流 | 浏览器 `<img>` |
+| `GET /snapshot.jpg` | 单帧 JPEG，带 800ms 缓存 | agent 截图 |
+| `GET /windows` | 窗口列表 + 精确坐标（读 sway IPC） | agent 定位 |
+| `WS /ws` | 输入注入 + 剪贴板 | 浏览器 / 脚本 |
+
+`/snapshot.jpg` 和 `/windows` 是为 agent 加的：前者让它「看一眼现在什么样」
+不必订阅流，后者让它知道「该点哪里」。以前只能重启进程用 `-s` 截图，
+或者装 `grim`，或者靠截图猜坐标。
+
+```bash
+curl -s http://127.0.0.1:8765/snapshot.jpg -o /tmp/now.jpg
+curl -s http://127.0.0.1:8765/windows
+# {"windows":[{"app_id":"AgentTop","x":0,"y":0,"width":640,"height":720,"cx":320,"cy":360}]}
+```
+
+> **为什么 `/windows` 不用 `zwlr_foreign_toplevel_management`**：那个协议
+> 只给 title / app_id，**不给坐标**。而坐标恰恰是 agent 最需要的。
 
 ### 下行：WebSocket 剪贴板（沙箱 → 页面）
 
@@ -501,7 +525,27 @@ WAYLAND_DEBUG=client ./wstream -p 8765 2>&1 | grep -E "motion|button"
 
 如果能看到请求发出但光标不动 → 合成器不支持。**换 sway。**
 
-### 17. `start.sh` 里的 socket 名不能写死
+### 17. 不要每键都推 keymap —— 会把修饰位清零
+
+合成器收到新 keymap 会重建键盘状态、**修饰位归零**。每键都推的后果：
+`Ctrl+V` 退化成按一个 `v`，`Shift+v` 出小写。1.1.0 为「盖掉别人的残缺
+keymap」加了每键推送，把组合键全弄坏了 —— 而且 24 项测试一条都没测大写字母。
+
+### 18. 修饰键全释放时也必须发 modifiers
+
+`if (g_mods)` 让 `g_mods` 归零时**不发** modifiers，合成器一直以为 Shift
+按着 → `Upper` 打成 `UPPER`。要比较上次发的值，变了就发（包括发 0）。
+
+### 19. 终端里粘贴是 `Ctrl+Shift+V`
+
+`Ctrl+V` 在终端里是「引号转义」。GUI 程序才是 `Ctrl+V`。
+
+### 20. `/windows` 不能用 foreign-toplevel 协议
+
+它只给 title/app_id，**不给坐标**。要读 sway IPC `GET_TREE`。
+解析别用 strstr：JSON 里 `rect` 在 `app_id` 之前且节点嵌套，会错位。
+
+### 21. `start.sh` 里的 socket 名不能写死
 
 sway 的 socket 不一定是 `wayland-0`（多实例时会是 `wayland-1`）。
 必须动态探测：
@@ -510,7 +554,7 @@ sway 的 socket 不一定是 `wayland-0`（多实例时会是 `wayland-1`）。
 WL=$(basename "$(ls "$ROOT"/run/wayland-* 2>/dev/null | head -1)")
 ```
 
-### 18. sway 没有 labwc 的 `-S` 启动钩子
+### 22. sway 没有 labwc 的 `-S` 启动钩子
 
 labwc 支持 `labwc -S script.sh`，sway 只能用配置文件里的 `exec`：
 
@@ -518,7 +562,7 @@ labwc 支持 `labwc -S script.sh`，sway 只能用配置文件里的 `exec`：
 exec /path/to/desktop.sh
 ```
 
-### 19. `pkill -f xxx` 会杀掉自己的 shell
+### 23. `pkill -f xxx` 会杀掉自己的 shell
 
 因为 bash 的命令行里也包含那个字符串。用 `pgrep -x`（精确匹配进程名）更安全。
 
@@ -572,6 +616,26 @@ wstream.c
 ├── 内嵌前端页面          (INDEX_HTML)
 └── main                 (参数解析、抓帧主循环)
 ```
+
+### 给 agent 用的 Python 客户端
+
+`clients/wstream_client.py`（零依赖，只用标准库）：
+
+```python
+import sys; sys.path.insert(0, "clients")
+from wstream_client import WStream
+
+with WStream() as ws:
+    ws.take()                            # 不调这个，所有输入都会被丢弃
+    for w in ws.windows():
+        print(w["app_id"], (w["cx"], w["cy"]))
+    ws.click_window("AgentTop")
+    ws.type_text("echo hello"); ws.press("enter")
+    ws.type_any("中文内容"); ws.press("enter")   # 自动走剪贴板
+    ws.snapshot("/tmp/shot.jpg")
+```
+
+详见 [clients/README.md](clients/README.md)。
 
 ### 调试技巧
 
