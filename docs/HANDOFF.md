@@ -15,11 +15,15 @@
 
 ```bash
 git log --oneline
+# b52df85 修复安全漏洞：WebSocket 不校验来源 + clients[] 并发越界（1.0.1）
+# 6f43015 新增交接文档与 AI agent skill
 # a2816cb CI 冒烟测试改用快照模式验证抓帧，不再依赖 MJPEG 流
 # e8c7316 修复容器/CI 里 sway 无法执行：绕开 cap_sys_nice 文件能力
 # de64658 修复 CI 冒烟测试超时：sway 启动等待从 15s 放宽到 60s
 # 6ae7806 wstream 1.0.0：把无头 Wayland 桌面推流到浏览器并支持反向操作
 ```
+
+tag：`v1.0.0`（首个可用版本）、`v1.0.1`（安全修复，**推荐**）。
 
 ---
 
