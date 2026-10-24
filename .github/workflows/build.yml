@@ -11,7 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: archlinux:latest
-      options: --user root
+      # SYS_NICE 是必需的：Arch 打包的 /usr/bin/sway 带 cap_sys_nice=ep，
+      # 容器内 root 若没有该 capability，execve 会直接返回 EPERM，
+      # 报错形如 `env: 'sway': Operation not permitted`。
+      options: --user root --cap-add SYS_NICE
 
     steps:
       - name: 安装依赖
@@ -19,6 +22,12 @@ jobs:
           pacman -Syu --noconfirm --needed \
             git gcc pkgconf wayland libjpeg-turbo libxkbcommon \
             wlr-protocols sway grim
+
+      - name: 环境自检
+        run: |
+          echo "sway 文件能力：$(getcap "$(command -v sway)" || echo 无)"
+          echo "当前 capabilities：$(grep CapEff /proc/self/status)"
+          sway --version
 
       - uses: actions/checkout@v4
 

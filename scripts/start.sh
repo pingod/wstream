@@ -67,13 +67,28 @@ XEOF
   } > "$ROOT/cfg/sway/config"
 
   log "启动无头沙箱 $SIZE …"
+
+  # ── 容器 / CI 兼容：绕过 sway 的 cap_sys_nice ──────────────────────
+  # Arch 打包的 /usr/bin/sway 带文件能力 cap_sys_nice=ep。在 Docker/CI 容器里
+  # root 往往没有 CAP_SYS_NICE，此时 execve 直接返回 EPERM，报错长这样：
+  #     env: 'sway': Operation not permitted
+  # 这不是 sway 的问题，也不是我们的问题。处理办法：把二进制复制一份，
+  # 复制会丢掉文件能力，然后用副本启动。
+  SWAY_BIN="$(command -v sway || true)"
+  [ -n "$SWAY_BIN" ] || die "找不到 sway，先装：sudo pacman -S --needed sway"
+  if command -v getcap >/dev/null 2>&1 && [ -n "$(getcap "$SWAY_BIN" 2>/dev/null)" ]; then
+    SWAY_COPY="$ROOT/sway-nocap"
+    cp "$SWAY_BIN" "$SWAY_COPY" 2>/dev/null && chmod +x "$SWAY_COPY" 2>/dev/null \
+      && SWAY_BIN="$SWAY_COPY"
+  fi
+
   # -u DISPLAY 很关键：否则 GTK/Qt 程序会连着真实桌面的 Xwayland，
   # 窗口会跑到用户真实桌面上（踩过：firefox 泄漏到真实 workspace）。
   setsid env -u DISPLAY \
     XDG_RUNTIME_DIR="$ROOT/run" XDG_CONFIG_HOME="$ROOT/cfg" \
     WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_HEADLESS_OUTPUTS=1 \
     __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json \
-    sway --unsupported-gpu > "$ROOT/sway.log" 2>&1 &
+    "$SWAY_BIN" --unsupported-gpu > "$ROOT/sway.log" 2>&1 &
   echo $! > "$ROOT/sway.pid"
 
   # sway 的 socket 名不一定是 wayland-0（多实例时会是 wayland-1），动态找。
