@@ -1,0 +1,61 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --user root
+
+    steps:
+      - name: 安装依赖
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git gcc pkgconf wayland libjpeg-turbo libxkbcommon \
+            wlr-protocols sway grim
+
+      - uses: actions/checkout@v4
+
+      - name: 编译
+        run: |
+          ./build.sh
+
+      - name: 检查零警告
+        run: |
+          out=$(./build.sh 2>&1)
+          echo "$out"
+          if echo "$out" | grep -qi "warning:"; then
+            echo "::error::编译出现警告"
+            exit 1
+          fi
+
+      - name: 冒烟测试（无头沙箱 + 抓帧）
+        run: |
+          set -x
+          ./scripts/start.sh 1280x720
+          sleep 8
+          # HTTP 首页可达
+          curl -fsS -o /dev/null http://127.0.0.1:8765/
+          # MJPEG 流有数据
+          curl -fsS --max-time 5 http://127.0.0.1:8765/stream.mjpg -o /tmp/stream.bin || true
+          test -s /tmp/stream.bin && echo "MJPEG OK ($(stat -c%s /tmp/stream.bin) bytes)"
+          # 快照模式能出图
+          WL=$(cat /tmp/wstream/wl_name)
+          XDG_RUNTIME_DIR=/tmp/wstream/run WAYLAND_DISPLAY="$WL" \
+            ./wstream -p 8899 -s /tmp/shot.ppm
+          test -s /tmp/shot.ppm && echo "snapshot OK"
+          ./scripts/start.sh stop
+
+      - name: 上传快照
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot
+          path: /tmp/shot.ppm
+          if-no-files-found: ignore

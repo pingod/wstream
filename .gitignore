@@ -1,0 +1,18 @@
+# 编译产物
+wstream
+*.o
+*.a
+*.so
+
+# wayland-scanner 生成
+proto/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
+
+# 系统
+.DS_Store
+Thumbs.db
