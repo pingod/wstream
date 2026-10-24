@@ -40,6 +40,8 @@
 - [踩过的坑](#踩过的坑)
 - [已知限制](#已知限制)
 - [开发](#开发)
+- [给 AI agent 用（skill）](#给-ai-agent-用skill)
+- [文档索引](#文档索引)
 - [许可证](#许可证)
 
 ---
@@ -475,6 +477,42 @@ XDG_RUNTIME_DIR=/tmp/wstream/run WAYLAND_DISPLAY=wayland-1 grim -c /tmp/s.png
 | `wlr-screencopy-unstable-v1` | 系统包 `wlr-protocols` |
 | `wlr-virtual-pointer-unstable-v1` | 系统包 `wlr-protocols` |
 | `virtual-keyboard-unstable-v1` | **仓库内自带**（发行版都不打这个包） |
+
+---
+
+## 给 AI agent 用（skill）
+
+仓库自带一份 skill，装上之后 AI agent 就知道怎么用 wstream 操作 GUI。
+
+```bash
+mkdir -p ~/.agents/skills/wstream
+cp skills/wstream/SKILL.md ~/.agents/skills/wstream/
+```
+
+内容包含：
+- 什么时候该用 / 不该用
+- **可直接复制的 Python 代码**（WebSocket 连接、鼠标移动点击、键盘打字、组合键）
+- 完整的 evdev 扫描码映射表
+- 怎么在沙箱里启动 GUI 程序（含必须的环境变量）
+- 隔离性验证方法
+- 症状速查表
+- 四条红线
+
+源码：`skills/wstream/SKILL.md`
+
+---
+
+## 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| [README.md](README.md) | 本文件：项目介绍、用法、性能、踩坑记录 |
+| [docs/PROTOCOLS.md](docs/PROTOCOLS.md) | Wayland 协议详解：抓帧、指针注入、键盘 keymap、WS 帧格式 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 线程模型、主循环、数据结构、设计决策 |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 按症状索引的排障手册 |
+| [docs/HANDOFF.md](docs/HANDOFF.md) | **接手必读**：现状、五个不能再踩的坑、下一步建议 |
+| [CHANGELOG.md](CHANGELOG.md) | 版本历史 + 14 个已修 bug 清单 |
+| [skills/wstream/SKILL.md](skills/wstream/SKILL.md) | 给 AI agent 的操作手册 |
 
 ---
 

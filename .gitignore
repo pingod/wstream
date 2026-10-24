@@ -1,11 +1,13 @@
 # 编译产物
-wstream
+# ⚠️ 必须写成 /wstream（带斜杠）只匹配仓库根目录的二进制文件。
+#    写裸 `wstream` 会连 skills/wstream/ 整个目录一起忽略掉（踩过）。
+/wstream
 *.o
 *.a
 *.so
 
 # wayland-scanner 生成
-proto/
+/proto/
 
 # 编辑器
 .vscode/
