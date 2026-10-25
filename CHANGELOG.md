@@ -2,6 +2,40 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.4.2] - 2026-10-25
+
+修**测试自身**的 flake。生产代码一行没改 —— 坏的是测试会干扰自己。
+
+连续跑两轮 `tests/wstest.py`，第一轮 22/22，第二轮固定挂 3~4 项
+（鼠标点击到达探针 / ASCII 按键 / Enter），看起来像输入注入坏了。
+
+### 修复
+
+| # | 现象 | 原因 |
+|---|---|---|
+| A | 第二轮起固定挂 3~4 项，越跑越乱 | `Popen(["setsid", ...], start_new_session=True)` 让 `p.terminate()` 杀错对象，测试窗口变成幽灵留在沙箱 |
+| B | 终端刚起来时点不中（「中文注入到达终端」莫名失败） | 窗口 map 后布局还没算完，第一次读到的坐标是过渡态 |
+| C | 测试 Traceback：`'NoneType' object has no attribute 'startswith'` | sway JSON 里容器的 `app_id` 是显式 `null`，`get(key, "")` 兜不住 |
+
+**A 的修法**：`start_new_session=True` 已经让子进程成为 session leader，再套
+`setsid` 命令会让它 fork 后立即退出，`p.pid` 指向那个短命进程 —— 真正的探针/终端
+成了孤儿。（注意 `kill_stale_test_windows` 在开头清残留会**掩盖**这个 bug：
+测试照样全绿，只是多一行提示。所以补了硬断言 `跑完不留测试窗口`。）
+
+**B 的修法**：`wait_window_settled()` 要求连续两次读到同一坐标才采信；
+`terminate_and_wait()` 关窗口后等它真的从 window tree 消失，不只看进程。
+
+**C 的修法**：`(node.get("app_id") or "")`。
+
+### 验证
+
+- 连续 5 轮 `tests/wstest.py` 全绿（新增自检断言后 23 项），无残留
+- `tests/lifecycle.py` 15/15
+- **反向验证**：把 `setsid` 加回去 → `❌ 跑完不留测试窗口 (残留=['WSTREAM_X11_PROBE'])`，
+  22 通过 / 1 失败。测试确实能抓到这个 bug。
+- 停机后 `wstream/sway-nocap/desktop.sh/alacritty/x11probe` 残留全 0
+- 沙箱最终窗口只剩 `AgentTop`/`AgentSub`（演示终端没被误杀）
+
 ## [1.4.1] - 2026-10-25
 
 修进程泄漏。功能一直是好的，坏在**每跑一次 start/stop 就漏一批进程**。

@@ -209,6 +209,162 @@ def sandbox_env():
     return env
 
 
+def kill_stale_test_windows(env):
+    """清掉上一次测试留下的窗口和进程。
+
+    ⚠️ 为什么必须有这一步：这个测试会起窗口（X11 探针、WStreamTest 终端），
+    正常退出时 terminate() 会收掉它们。但只要有一次被 Ctrl-C、超时或断言
+    异常打断，那些窗口就留在沙箱里了。
+
+    下一轮再跑时，沙箱里会有**两个** WSTREAM_X11_PROBE / 两对 WStreamTest。
+    get_geometry() 按窗口树顺序返回第一个匹配 —— 于是拿到了**上一轮**那个
+    没人读的旧窗口坐标，所有点击和按键都打进了幽灵窗口。
+
+    表现极具迷惑性：同一份代码第一轮 22/22 全过，第二轮挂 3 项
+    （鼠标点击/ASCII/Enter），看起来像功能坏了，其实是被自己的残留干扰。
+    实测确实是这个原因：第二轮 swaymsg 里看到 2 个 WSTREAM_X11_PROBE、
+    2 个 WStreamTest、2 个 WStreamTest2。
+
+    这跟 start.sh 里 desktop.sh 泄漏是同一类 bug —— 起东西的人得负责收掉。
+    """
+    killed = 0
+    for name in ("x11probe", "alacritty"):
+        try:
+            raw = subprocess.run(["pgrep", "-x", name], env=env,
+                                 capture_output=True, text=True,
+                                 timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for tok in raw.split():
+            if not tok.isdigit():
+                continue
+            pid = int(tok)
+            # 只清本沙箱里的：XDG_RUNTIME_DIR 必须指向 $ROOT/run。
+            # 沙箱外的 alacritty（用户自己开的终端）绝对不能碰。
+            if not _belongs_to_sandbox(pid):
+                continue
+            # 沙箱里的 alacritty 还有 desktop.sh 起的演示终端（AgentTop/AgentSub），
+            # 那些是沙箱体验的一部分，不能杀 —— 只清测试自己起的 WStreamTest。
+            if name == "alacritty" and not _cmdline_has(pid, "WStreamTest"):
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed += 1
+            except OSError:
+                continue
+    if killed:
+        print(f"     ⚠️ 清掉 {killed} 个上次残留的测试进程")
+        time.sleep(1.0)
+    # 杀进程不等于窗口立刻消失：sway 要把 surface 从树里摘掉、重新平铺邻居，
+    # 各需要一轮事件循环。不等它，下一轮就可能拿到「正在死」的窗口坐标。
+    _wait_test_windows_gone(env)
+
+
+def _wait_test_windows_gone(env, timeout=8.0):
+    """等到窗口树里再没有测试窗口，最多等 timeout 秒。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        names = _test_windows_in_tree(env)
+        if not names:
+            return True
+        time.sleep(0.25)
+    if _test_windows_in_tree(env):
+        print(f"     ⚠️ 仍有测试窗口没消失: {_test_windows_in_tree(env)}")
+    return False
+
+
+def _test_windows_in_tree(env):
+    """沙箱窗口树里属于本测试的 app_id / 窗口名。"""
+    try:
+        out = subprocess.run(["swaymsg", "-t", "get_tree"], env=env,
+                             capture_output=True, text=True, timeout=5).stdout
+        import json
+        tree = json.loads(out)
+    except Exception:
+        return []
+    found = []
+
+    def walk(node):
+        # ⚠️ 用 `or ""` 而不是 get(key, "")：sway 的 JSON 里 app_id 常常是
+        #    **显式的 null**（容器节点、X11 窗口）。get 的默认值只在键不存在时
+        #    生效，值是 null 时照样返回 None → None.startswith 崩掉。
+        if (node.get("app_id") or "").startswith("WStreamTest"):
+            found.append(node["app_id"])
+        if node.get("name") == "WSTREAM_X11_PROBE":
+            found.append("WSTREAM_X11_PROBE")
+        for c in node.get("nodes", []) + node.get("floating_nodes", []):
+            walk(c)
+
+    walk(tree)
+    return found
+
+
+def terminate_and_wait(proc, env, app_id, timeout=8.0):
+    """关掉子进程并等它的窗口真的从窗口树消失。
+
+    ⚠️ 只 terminate() 是不够的：进程收到了信号，sway 还要处理 unmap、
+    把它从布局里摘出去、重新平铺剩下的窗口。这段空窗期里下一个同名窗口
+    可能还没拿到最终坐标，或者旧窗口还占着位置 —— 两个终端测试连着跑时
+    就踩到了这个（第二轮之后「中文注入到达终端」等 6 项全挂）。
+    """
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if app_id not in _test_windows_in_tree(env):
+            break
+        time.sleep(0.2)
+    try:
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def wait_window_settled(env, app_id, timeout=12.0):
+    """等窗口出现**并完成布局**，返回中心坐标或 None。
+
+    ⚠️ 为什么要连续两次读数一致：窗口 map 之后 sway 要给它分配布局、
+    可能还要把已有窗口重新平铺一遍。刚落下的第一帧坐标往往是过渡态，
+    照着它点会点到别处 —— 表现为「文本没落到终端里」这种莫名失败。
+    连续两次读到同一个坐标才算稳定。
+    """
+    deadline = time.time() + timeout
+    prev = None
+    while time.time() < deadline:
+        pos = get_geometry_by_appid(env, app_id)
+        if pos is not None and pos == prev:
+            return pos
+        prev = pos
+        time.sleep(0.2)
+    return prev
+
+
+def _cmdline_has(pid, needle):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return needle in f.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+
+
+def _belongs_to_sandbox(pid):
+    want = os.path.join(ROOT, "run")
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            envs = f.read().decode("utf-8", "replace").split("\0")
+    except OSError:
+        return False
+    for e in envs:
+        if e.startswith("XDG_RUNTIME_DIR="):
+            return e.split("=", 1)[1] == want
+    return False
+
+
 def get_geometry_by_appid(env, app_id):
     """按 app_id 查窗口中心坐标。找不到返回 None。"""
     try:
@@ -220,14 +376,18 @@ def get_geometry_by_appid(env, app_id):
         def walk(node):
             if node.get("app_id") == app_id and "rect" in node:
                 r = node["rect"]
-                return (r["x"] + r["width"] // 2, r["y"] + r["height"] // 2)
+                # 万一还有多个同名窗口（残留没清干净），取 pid 最大的 = 最新起的
+                cands.append((node.get("pid") or 0, r["x"] + r["width"] // 2,
+                              r["y"] + r["height"] // 2))
             for c in node.get("nodes", []) + node.get("floating_nodes", []):
-                got = walk(c)
-                if got:
-                    return got
-            return None
+                walk(c)
 
-        return walk(tree)
+        cands = []
+        walk(tree)
+        if cands:
+            cands.sort()
+            return (cands[-1][1], cands[-1][2])
+        return None
     except Exception:
         return None
 
@@ -238,8 +398,18 @@ def start_probe():
     if os.path.exists(log):
         os.unlink(log)
     env = sandbox_env()
-    # setsid：脱离当前会话组，避免父 shell 收到信号时连带杀掉
-    p = subprocess.Popen(["setsid", "./tests/x11probe"],
+    # ⚠️ 只用 start_new_session=True，**不要**再套一层 `setsid` 命令。
+    #
+    # start_new_session 已经让子进程成为新 session 的 leader 了。此时再执行
+    # `setsid` 命令，它发现自己已经是 pgroup leader，就得 fork 一次才能 setsid，
+    # 然后**父进程立即退出** —— Popen 拿到的 p.pid 指向那个短命的 setsid，
+    # 真正的探针成了孤儿（被 init 收养）。
+    #
+    # 后果：后面 p.terminate() 打在一个已经退出的 pid 上，探针根本没被杀。
+    # 每跑一次测试就在沙箱里多留一个 WSTREAM_X11_PROBE 窗口，几轮之后
+    # get_geometry() 会拿到幽灵窗口的坐标，点击和按键全打进没人读的旧窗口 ——
+    # 表现为「同一份代码第一轮 22/22、第二轮挂 3 项」。
+    p = subprocess.Popen(["./tests/x11probe"],
                          stdout=open(log, "w"), stderr=subprocess.STDOUT,
                          env=env, start_new_session=True)
     for _ in range(100):
@@ -314,6 +484,10 @@ def get_geometry(env):
 
     sway 默认平铺，窗口不一定是我们要的坐标。用 swaymsg 查最准；
     查不到就退化成「点屏幕中心」——探针会占据一块可见区域。
+
+    ⚠️ 有多个同名窗口时取 **pid 最大的**（= 最新起的）。残留没清干净时，
+    按树顺序取第一个会拿到上一轮的幽灵窗口，之后的点击/按键全打进那里，
+    表现为「同一份代码时过时不过」。
     """
     try:
         out = subprocess.run(["swaymsg", "-t", "get_tree"], env=env,
@@ -321,19 +495,23 @@ def get_geometry(env):
         import json
         tree = json.loads(out)
 
+        cands = []
+
         def walk(node):
             if node.get("name") == "WSTREAM_X11_PROBE" and "rect" in node:
                 r = node["rect"]
-                return (r["x"] + r["width"] // 2, r["y"] + r["height"] // 2)
+                cands.append((node.get("pid") or 0,
+                              r["x"] + r["width"] // 2,
+                              r["y"] + r["height"] // 2))
             for c in node.get("nodes", []) + node.get("floating_nodes", []):
-                got = walk(c)
-                if got:
-                    return got
-            return None
+                walk(c)
 
-        got = walk(tree)
-        if got:
-            return got
+        walk(tree)
+        if cands:
+            cands.sort()
+            if len(cands) > 1:
+                print(f"     ⚠️ 有 {len(cands)} 个探针窗口，用最新的那个")
+            return (cands[-1][1], cands[-1][2])
     except Exception:
         pass
     return None
@@ -369,6 +547,9 @@ def main():
 
     print("── 0. 等 wstream 就绪 ──")
     check("wstream 可服务", wait_ready())
+    # 上一步只保证服务在，沙箱里可能还留着上一次被打断的测试留下的窗口。
+    # 不清理的话，get_geometry 可能拿到幽灵窗口的坐标（见 kill_stale_test_windows）。
+    kill_stale_test_windows(env)
 
     print("── 1. 来源校验 ──")
     K = base64.b64encode(b"abcdefgh12345678").decode()
@@ -457,16 +638,11 @@ def main():
         if os.path.exists(typed):
             os.unlink(typed)
         term = subprocess.Popen(
-            ["setsid", "env", "-u", "DISPLAY", "alacritty", "--class", "WStreamTest",
+            ["env", "-u", "DISPLAY", "alacritty", "--class", "WStreamTest",
              "-e", "sh", "-c", f"cat > {typed}"],
             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True)
-        tpos = None
-        for _ in range(60):
-            time.sleep(0.2)
-            tpos = get_geometry_by_appid(env, "WStreamTest")
-            if tpos:
-                break
+        tpos = wait_window_settled(env, "WStreamTest")
         if tpos:
             print(f"     终端窗口中心: {tpos}")
             ws_send(s, 2, 1, 0)          # 先确保没有按下的键
@@ -497,10 +673,7 @@ def main():
         else:
             check("中文注入到达终端", False, "(终端窗口没起来)")
             check("中文前后 ASCII 都正常", False, "(终端窗口没起来)")
-        try:
-            term.terminate()
-        except Exception:
-            pass
+        terminate_and_wait(term, env, "WStreamTest")
 
         print("── 6/6b/7. 用 Wayland 终端验证（不依赖 X11）──")
         # ⚠️ 为什么改到这里用终端而不是 X11 探针：
@@ -511,16 +684,11 @@ def main():
         if os.path.exists(typed2):
             os.unlink(typed2)
         term2 = subprocess.Popen(
-            ["setsid", "env", "-u", "DISPLAY", "alacritty", "--class", "WStreamTest2",
+            ["env", "-u", "DISPLAY", "alacritty", "--class", "WStreamTest2",
              "-e", "sh", "-c", f"cat > {typed2}"],
             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True)
-        t2 = None
-        for _ in range(60):
-            time.sleep(0.2)
-            t2 = get_geometry_by_appid(env, "WStreamTest2")
-            if t2:
-                break
+        t2 = wait_window_settled(env, "WStreamTest2")
         if t2 and HAVE_PROBE:
             # 有探针时只用它来确认焦点切换能力；文本结论一律看终端文件
             pass
@@ -606,10 +774,7 @@ def main():
                        "非持有者输入被丢弃", "持有者输入仍生效",
                        "转移后新持有者可操作"]:
                 print(f"     ⏭ 跳过 {nm}（终端窗口没起来）")
-        try:
-            term2.terminate()
-        except Exception:
-            pass
+        terminate_and_wait(term2, env, "WStreamTest2")
 
         print("── 8. 剪贴板双向同步 ──")
         # ⚠️ 这里必须新开一个连接：上面的 s2 在步骤 7 里已经 close 了。
@@ -658,6 +823,17 @@ def main():
             probe.terminate()
         except Exception:
             pass
+
+    # ⚠️ 自检：跑完必须不留测试窗口。
+    #
+    # 为什么非要这一条：kill_stale_test_windows() 在开头会清残留，所以
+    # 「terminate() 失效」这种 bug 会被开头的清理自动掩盖 —— 测试照样全绿，
+    # 只是每轮开头多打一行「清掉 N 个残留」。那行字是唯一的信号，很容易被忽略。
+    # 这个断言把「有没有漏东西」变成硬失败，让 bug 无处可藏。
+    time.sleep(1.5)
+    leftover = _test_windows_in_tree(env)
+    check("跑完不留测试窗口", not leftover,
+          f"(残留={leftover})" if leftover else "")
 
     print()
     print(f"通过 {len(PASSES)} 项，失败 {len(FAILS)} 项")
