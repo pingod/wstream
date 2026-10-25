@@ -2,6 +2,57 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.4.1] - 2026-10-25
+
+修进程泄漏。功能一直是好的，坏在**每跑一次 start/stop 就漏一批进程**。
+
+### 新增
+
+| 新增项 | 说明 |
+|---|---|
+| `scripts/stop-all.sh` | 一次停掉本机所有实例。默认先列再确认，`--yes` 跳过，`--dry-run` 只列 |
+| `tests/lifecycle.py` | 生命周期回归测试（15 项）：起停零残留、死 socket 恢复、孤儿清理 |
+
+### 修复
+
+| # | 现象 | 原因 |
+|---|---|---|
+| A | 每轮 start/stop 漏一批 `desktop.sh` + alacritty，实测累积 17 个孤儿 | `own_pids()` 只列了 `wstream/sway-nocap/sway`，漏了 `desktop.sh` 和窗口程序 |
+| B | sway 崩了之后，之后每次 start 都「连不上 Wayland」永久卡死 | 复用判据是 `ls run/wayland-*`（文件存在），进程死了 socket 文件还在 |
+| C | 实例目录被删后，它的孤儿进程永远清不掉 | `stop-all.sh` 的归属判据要求目录**存在** |
+
+**A 的修法**：`own_pids` 覆盖沙箱里会出现的所有程序名。名字列多了不会误伤用户桌面 ——
+归属判据仍是 `XDG_RUNTIME_DIR == $ROOT/run`。
+
+**B 的修法**：新增 `sandbox_alive()`，用 `wlr-randr` 真正握手探一下（没有就查
+`sway.pid` 的进程是否活着）。死 socket 会被识别并打印「发现残留的 wayland-N（进程已死），
+重建沙箱」。
+
+> 这和 1.3.1 的僵尸进程 bug 是同一个教训的两次重犯：**「文件存在」不等于「服务可用」**。
+> 第一次是 `pgrep` 能匹配到僵尸，这次是 socket 文件残留。**判据要落在「真的能连上」上。**
+
+**C 的修法**：归属判据放宽成「`XDG_RUNTIME_DIR=<root>/run` **且** cmdline 里有
+`<root>/` 开头的路径」，目录删了也能从 cmdline 认出。
+
+### 已验证（含反向验证）
+
+`tests/lifecycle.py` 15/15 通过。三个修复都做了**反向验证** —— 把修复回退掉，
+测试必须变红，实测：
+
+| 回退的修复 | 测试反应 |
+|---|---|
+| A（`desktop.sh` 移出 `own_pids`） | ❌ `stop 后零残留 (残留=[('desktop.sh','1592329')])` |
+| B（复用判据改回只看文件） | ❌ 6 项失败，含「死 socket 后端口可服务」 |
+
+「测试变绿」本身说明不了问题，得能变红才算数。
+
+### 说明
+
+`stop-all.sh` 只按 XDG_RUNTIME_DIR 归属判断，**绝不按进程名裸杀** ——
+`sway` 这个名字用户桌面也在用。实测执行后 Hyprland 与用户的 Xwayland 未受影响。
+
+---
+
 ## [1.4.0] - 2026-10-25
 
 多实例支持。多个 AI agent 可以各跑一套完全隔离的虚拟桌面，互不干扰。

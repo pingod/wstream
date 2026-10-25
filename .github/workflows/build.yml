@@ -93,6 +93,14 @@ jobs:
 
           ./scripts/start.sh stop
 
+      # 生命周期测试：起停是否留垃圾、死 socket 能否恢复、孤儿能否清理。
+      # 这些 bug 不会让任何功能断言变红 —— 功能全好，只是每跑一次漏一批进程。
+      # 用的是独立目录 /tmp/wstream-lc-test，不碰上面的默认实例。
+      - name: 生命周期回归测试
+        run: |
+          set -x
+          python3 tests/lifecycle.py
+
       - name: 失败时打印日志
         if: failure()
         run: |

@@ -277,6 +277,11 @@ with WStream(port=8801) as ws:   # agent 1
 WSTREAM_ROOT=/tmp/ws-agent1 ./scripts/start.sh stop
 ```
 
+收工时一次全停（不用记有哪些实例）：
+```bash
+./scripts/stop-all.sh --yes
+```
+
 ### 方式 B：在沙箱里直接跑命令（更简单）
 
 如果只是要"在沙箱里执行某个 GUI 程序"，不用注入，直接启动即可：

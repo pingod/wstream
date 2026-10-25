@@ -609,13 +609,26 @@ http://127.0.0.1:8802
 > 跨端口建不了 WebSocket。但 `<img>` 加载 MJPEG 不带 `Origin`，
 > `Host` 也是回环地址，能通过校验 —— 所以看画面没问题，操作要点进原生页面。
 
-### 单独停止某个实例
+### 停止实例
+
+**停某一个**（必须带 `WSTREAM_ROOT`）：
 ```bash
 WSTREAM_ROOT=/tmp/ws-a ./scripts/start.sh stop
 ```
 
-> ⚠️ 必须带 `WSTREAM_ROOT`。不带的话会按默认 `/tmp/wstream` 处理，
-> 停的是另一个实例（或什么都没停）。
+> ⚠️ 不带 `WSTREAM_ROOT` 会按默认 `/tmp/wstream` 处理，
+> 停的是另一个实例（或什么都没停），而且**看起来是成功的**。
+
+**全停**（收工 / 清理所有 agent 的实例）：
+```bash
+./scripts/stop-all.sh             # 列出要停的实例，确认后执行
+./scripts/stop-all.sh --yes       # 不确认（CI / 脚本用）
+./scripts/stop-all.sh --dry-run   # 只列不停
+```
+
+`stop-all.sh` 的安全设计：只按 **XDG_RUNTIME_DIR 归属**判断，绝不按进程名裸杀
+（`sway` 这个名字你桌面也在用）。它会连 `desktop.sh` 和沙箱里的窗口程序一起清掉 ——
+这些以前会残留，每跑一轮漏一批。
 
 ### 资源成本
 

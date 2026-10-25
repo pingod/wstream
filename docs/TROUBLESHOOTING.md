@@ -4,6 +4,30 @@
 
 ---
 
+## 先确认你在看哪个实例
+
+多实例（多个 agent 各一套桌面）时，下面所有命令都要注意**别把实例看串了**。
+`pgrep -a wstream` 会列出**所有**实例，`/tmp/wstream` 也不一定是你要查的那个。
+
+```bash
+./scripts/list.sh          # 最省事：列出所有实例的端口 / 状态 / 目录
+./scripts/list.sh --url    # 只要 URL
+```
+
+定位到某个实例之后，再带着它跑诊断命令：
+
+```bash
+export WSTREAM_ROOT=/tmp/ws-a     # ← 换成你的实例目录
+WL=$(cat "$WSTREAM_ROOT/wl_name")
+export XDG_RUNTIME_DIR="$WSTREAM_ROOT/run" WAYLAND_DISPLAY="$WL"
+```
+
+> ⚠️ 文档里的 `pgrep -a wstream` / `pgrep -a sway` 这类命令是**全局**的。
+> 只读查看没问题；**要杀进程时绝不能用它们** —— 会把别的实例和你的桌面一起杀掉。
+> 收工用 `./scripts/stop-all.sh`（它会按实例归属判断，不碰用户桌面）。
+
+---
+
 ## 画面相关
 
 ### 浏览器一片黑 / 一直转圈

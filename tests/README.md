@@ -22,6 +22,23 @@ python3 tests/wstest.py
 
 退出码 0 = 全通过。
 
+## 两个测试文件
+
+| 文件 | 测什么 | 什么时候跑 |
+|---|---|---|
+| `tests/wstest.py` | **功能**：注入、来源校验、剪贴板、所有权（22 项） | 改了 src/wstream.c、前端 |
+| `tests/lifecycle.py` | **生命周期**：起停是否留垃圾、死 socket、孤儿清理（15 项） | 改了 scripts/ |
+
+功能正常但每跑一次漏一批进程，这种 bug 不会让任何功能断言变红，只能靠
+`lifecycle.py` 抓。它只操作 `/tmp/wstream-lc-test`，不碰你的默认实例。
+
+```bash
+python3 tests/lifecycle.py     # 约 2 分钟，会真起停几次
+```
+
+`lifecycle.py` 覆盖的三个坑（HANDOFF 坑 25~27）都做过**反向验证**：
+把修复回退掉，测试必须变红（实测确实变红，并指出是哪个进程残留）。
+
 ## 覆盖什么
 
 | # | 项目 | 防的是哪个坑 |

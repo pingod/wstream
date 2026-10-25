@@ -60,13 +60,48 @@ belongs_to_root() {
   [ "$rt" = "$ROOT/run" ]
 }
 
-# 列出本实例的 wstream/sway 进程 pid
+# 列出本实例的所有进程 pid（wstream / sway / 沙箱里的应用）。
+#
+# ⚠️ 必须包含 desktop.sh 和窗口程序。踩过：own_pids 只列了
+# wstream/sway-nocap/sway 三个名字，`desktop.sh`（sway 的 exec 钩子，
+# 内部 while 循环 sleep 36000）和它起的 alacritty **从来没被停过**。
+# 每跑一次 start/stop 就漏一批，实测累积到 17 个孤儿 desktop.sh。
+# 它们持有旧的 XDG_RUNTIME_DIR，还会继续占内存、刷 sway 的 CPU。
+#
+# 判据统一走 belongs_to_root（XDG_RUNTIME_DIR == $ROOT/run），
+# 所以列进来的名字多一点也不会误伤用户真实桌面的进程。
+SANDBOX_APPS="wstream sway-nocap sway desktop.sh alacritty foot kitty xterm"
 own_pids() {
-  for name in wstream sway-nocap sway; do
+  for name in $SANDBOX_APPS; do
     for p in $(pgrep -x "$name" 2>/dev/null); do
       belongs_to_root "$p" && echo "$p"
     done
   done
+}
+
+# 沙箱 socket 能不能**真的连上**（不只是文件存在）。
+#
+# ⚠️ 为什么不能只看 `ls "$ROOT"/run/wayland-*`：socket 文件是 sway 退出后
+# 残留的普通文件，进程死了它照样在。踩过：sway 崩了 / 被 OOM 杀掉之后，
+# 下次 start 看到文件在 → 判定「沙箱已在运行，复用」→ 跳过启动 sway →
+# 但那个 socket 根本没人监听 → wstream 连不上 Wayland 立刻退出。
+# 更糟的是这个状态**永久卡住**：每次 start 都走同一条错误分支，
+# 用户只能手动 rm -rf $ROOT 才能恢复，而报错只说「连不上 Wayland」，看不出根因。
+#
+# 判据用 wlr-randr 探一下：它要和 sway 真正握手。连得上=活的，连不上=死的。
+# 没有 wlr-randr 时退化成检查 sway.pid 里的进程是否还活着。
+sandbox_alive() {
+  local wl="$1"
+  [ -n "$wl" ] || return 1
+  if command -v wlr-randr >/dev/null 2>&1; then
+    XDG_RUNTIME_DIR="$ROOT/run" WAYLAND_DISPLAY="$wl" \
+      timeout 3 wlr-randr >/dev/null 2>&1
+    return $?
+  fi
+  # 兜底：看 pid 文件里的进程还在不在
+  local sp
+  sp=$(cat "$ROOT/sway.pid" 2>/dev/null)
+  [ -n "${sp:-}" ] && alive "$sp"
 }
 
 stop_all() {
@@ -100,10 +135,20 @@ if [ "${1:-}" = "stop" ]; then stop_all; exit 0; fi
 
 # ---------- 1. 无头沙箱 ----------
 WL=""
+# ⚠️ 判据是「socket 真的能连上」，不是「socket 文件存在」。
+# 只看文件存在会让「sway 崩了但 socket 残留」变成永久卡死状态，见 sandbox_alive 的说明。
+STALE_WL=""
 if [ -n "$(ls "$ROOT"/run/wayland-* 2>/dev/null | head -1)" ]; then
-  WL=$(basename "$(ls "$ROOT"/run/wayland-* 2>/dev/null | head -1)")
+  STALE_WL=$(basename "$(ls "$ROOT"/run/wayland-* 2>/dev/null | head -1)")
+fi
+if [ -n "$STALE_WL" ] && sandbox_alive "$STALE_WL"; then
+  WL="$STALE_WL"
   log "沙箱已在运行（$WL），复用"
 else
+  if [ -n "$STALE_WL" ]; then
+    log "发现残留的 $STALE_WL（进程已死），重建沙箱"
+  fi
+  # 只清自己的：别的实例的 $ROOT 是别的目录，不会到这里
   rm -rf "$ROOT"
   mkdir -p "$ROOT/run" "$ROOT/cfg/sway" "$ROOT/out"
   chmod 700 "$ROOT/run"
