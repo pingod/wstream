@@ -123,13 +123,73 @@ def move(s, x, y, w, h):
 
 # ---------------------------------------------------------------- 环境准备
 
+def sandbox_display(env):
+    """探测沙箱里 Xwayland 的 DISPLAY 号（形如 ":1"）。取不到返回 None。
+
+    ⚠️⚠️ 绝对不能硬编码 ":0"。踩过：`DISPLAY` 写死 ":0"，而沙箱 Xwayland
+    实际拿到的号取决于宿主机已占用几个 X display（用户桌面上跑着 Hyprland
+    时 ":0" 就是**用户真实的桌面**）。结果探针窗口开在了用户屏幕上，
+    用户的鼠标键盘也被注入到他自己的桌面里 —— 这是隔离性事故，不是测试失败。
+
+    三种探测手段，从可靠到兜底：
+      1. `swaymsg exec` 让沙箱自己回显 $DISPLAY（sway 会给子进程设好）—— 最准
+      2. 扫 /proc 找 XDG_RUNTIME_DIR 指向 $ROOT/run 的 Xwayland，读它的 -displayfd 名
+      3. 都没有就放弃，让调用方跳过 X11 断言（探针只是观测手段）
+    """
+    import glob, tempfile
+    # --- 1. swaymsg exec 回显 ---
+    fd, tmp = tempfile.mkstemp(prefix="wsdisp-")
+    os.close(fd)
+    try:
+        subprocess.run(["swaymsg", "exec", f"sh -c 'echo $DISPLAY > {tmp}'"],
+                       env=env, capture_output=True, timeout=5)
+        for _ in range(30):
+            time.sleep(0.1)
+            try:
+                with open(tmp) as f:
+                    got = f.read().strip()
+                if got.startswith(":"):
+                    return got
+            except OSError:
+                pass
+    except Exception:
+        pass
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+    # --- 2. 按 XDG_RUNTIME_DIR 找沙箱的 Xwayland，从 /proc/PID/cmdline 取 display ---
+    want = os.path.join(ROOT, "run")
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                envs = f.read().decode("utf-8", "replace").split("\0")
+            rt = [e for e in envs if e.startswith("XDG_RUNTIME_DIR=")]
+            if not rt or rt[0].split("=", 1)[1] != want:
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().decode("utf-8", "replace").split("\0")
+            if not argv or "Xwayland" not in os.path.basename(argv[0]):
+                continue
+            # cmdline 形如: Xwayland :1 -rootless ...
+            for a in argv[1:]:
+                if a.startswith(":") and a[1:].isdigit():
+                    return a
+        except OSError:
+            continue
+    return None
+
+
 def sandbox_env():
     with open(os.path.join(ROOT, "wl_name")) as f:
         wl = f.read().strip()
     env = dict(os.environ)
     env["XDG_RUNTIME_DIR"] = os.path.join(ROOT, "run")
     env["WAYLAND_DISPLAY"] = wl
-    env["DISPLAY"] = ":0"        # 沙箱内的 XWayland
     env.pop("WAYLAND_SOCKET", None)
     # ⚠️ 必须显式给 SWAYSOCK：sway 不会把它写进我们的环境，
     # 少了它 swaymsg 会报 "Unable to retrieve socket path"，
@@ -138,6 +198,14 @@ def sandbox_env():
     socks = glob.glob(os.path.join(ROOT, "run", "sway-ipc.*"))
     if socks:
         env["SWAYSOCK"] = socks[0]
+    # DISPLAY 必须是**探测**出来的，不能写死 :0（见 sandbox_display 的说明）。
+    # 探测失败就**删掉** DISPLAY，让 X11 探针连不上而失败退出 ——
+    # 绝不能退化成 :0，那在用户跑着 Hyprland/GNOME 时会连到他的真实桌面。
+    d = sandbox_display(env)
+    if d:
+        env["DISPLAY"] = d
+    else:
+        env.pop("DISPLAY", None)
     return env
 
 

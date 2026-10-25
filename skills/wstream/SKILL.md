@@ -249,6 +249,34 @@ printf '内容' | wl-copy     # 写
 timeout 2 wl-paste          # 读
 ```
 
+### 多 agent 并行：每个 agent 一套独立桌面
+
+多个 agent 同时要 GUI 时，各起一个实例，互不干扰：
+
+```bash
+WSTREAM_ROOT=/tmp/ws-agent1 WSTREAM_PORT=8801 ./scripts/start.sh
+WSTREAM_ROOT=/tmp/ws-agent2 WSTREAM_PORT=8802 ./scripts/start.sh
+```
+
+然后各用各的端口：
+
+```python
+with WStream(port=8801) as ws:   # agent 1
+    ...
+```
+
+查看有哪些实例在跑：
+
+```bash
+./scripts/list.sh        # 表格
+./scripts/list.sh --url  # 只要 URL
+```
+
+**注意**：`stop` 必须带 `WSTREAM_ROOT`，否则停的是默认实例：
+```bash
+WSTREAM_ROOT=/tmp/ws-agent1 ./scripts/start.sh stop
+```
+
 ### 方式 B：在沙箱里直接跑命令（更简单）
 
 如果只是要"在沙箱里执行某个 GUI 程序"，不用注入，直接启动即可：

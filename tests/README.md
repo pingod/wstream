@@ -36,6 +36,49 @@ python3 tests/wstest.py
 | 8 | 剪贴板双向同步 | data-control 不能要求焦点；type 7/8 不能被所有权拦掉 |
 | 9 | 修饰键释放 | Shift 松开后必须发 modifiers=0，否则 `Upper` → `UPPER` |
 
+## ⚠️ 最重要的一条：`DISPLAY` 绝不能硬编码 `":0"`
+
+`wstest.py` 原来写 `env["DISPLAY"] = ":0"`，注释是「沙箱内的 XWayland」。
+**假设是错的**，而且这是本项目发生过的最严重事故：窗口开到了用户真实桌面上。
+
+沙箱 Xwayland 的 display 号取决于宿主机**已占用几个** X display：
+
+| 场景 | `:0` 实际是谁 |
+|---|---|
+| CI 裸容器（没跑桌面） | 沙箱的 ✅ |
+| 用户桌面跑着 Hyprland/GNOME | **用户真实的桌面** ❌ |
+
+实测：用户桌面 `:0` = 4000x2560 Hyprland，沙箱 Xwayland = `:1` (1280x720)。
+用原来的写法起探针，`DISPLAY=:0 xdotool search` 真就查到了探针窗口 —— 在用户屏幕上。
+之后每一次点击、每一次按键注入，都打进了用户的真实会话。
+
+**为什么难发现**：断言表现为「点击没到达」「按键没到达」，看着像注入功能坏了。
+而 CI 是裸容器、`:0` 恰好是沙箱的，**CI 全程是绿的**。
+
+现在 `sandbox_display(env)` 三步探测：
+1. `swaymsg exec 'sh -c "echo $DISPLAY > /tmp/f"'` —— 让沙箱自己回显，最准
+2. 扫 `/proc/*/environ` 找 `XDG_RUNTIME_DIR == $ROOT/run` 的 Xwayland，读 cmdline
+3. 都取不到 → **删掉 `DISPLAY`**，探针连不上、干净失败
+
+**兜底方向是重点**：原来 `or ":0"` 是「探测失败就用默认」，而默认恰恰最危险。
+失败要往「连不上」的方向失败，不能往「连上用户桌面」的方向失败。
+
+## 怎么验证隔离真的生效
+
+不能只看断言通过 —— 断言失败可能是功能坏了，也可能是测试打错了地方。
+每次改测试，额外确认这两条：
+
+```bash
+# 真桌面（你正在用的）上不该有测试窗口
+DISPLAY=:0 xdotool search --name "WSTREAM_X11_PROBE" | wc -l    # 期望 0
+# 沙箱里应该有
+DISPLAY=:1 xdotool search --name "WSTREAM_X11_PROBE" | wc -l    # 期望 1
+```
+
+同类的坑：任何碰 `WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` / `DISPLAY` 的工具
+（`grim`、`wlr-randr`、`wl-copy`、`wl-paste`、`xdotool`、`xwd`）都必须显式指向沙箱。
+曾经还发生过：抓截图忘了设 `XDG_RUNTIME_DIR`，抓出了用户的真实桌面。
+
 ## 五个容易踩的测试环境问题
 
 **① `SWAYSOCK` 必须显式设置。**

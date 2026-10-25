@@ -45,6 +45,30 @@ port_serving() {
   curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:$1/" 2>/dev/null
 }
 
+# 这个进程属于**本实例**吗（XDG_RUNTIME_DIR 指向 $ROOT/run）。
+#
+# ⚠️ 为什么必须有这个：支持多实例（每个 agent 一套独立虚拟桌面）。
+# 但 pgrep -x wstream 是**全局**的，不分实例。踩过：起了 A(8801) 和 B(8802)，
+# B 启动时发现「有 wstream 进程但我的端口没在服务」，就把 A 也 kill -9 了，
+# 结果是「后起的踢掉先起的」。
+# 判断依据用 XDG_RUNTIME_DIR 而不是命令行参数：它由 start.sh 显式设置，
+# 且 /proc/PID/environ 随时可读，比解析 argv 可靠。
+belongs_to_root() {
+  p=$1
+  [ -r "/proc/$p/environ" ] || return 1
+  rt=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | sed -n 's/^XDG_RUNTIME_DIR=//p')
+  [ "$rt" = "$ROOT/run" ]
+}
+
+# 列出本实例的 wstream/sway 进程 pid
+own_pids() {
+  for name in wstream sway-nocap sway; do
+    for p in $(pgrep -x "$name" 2>/dev/null); do
+      belongs_to_root "$p" && echo "$p"
+    done
+  done
+}
+
 stop_all() {
   for f in "$ROOT"/*.pid; do
     [ -f "$f" ] || continue
@@ -53,18 +77,15 @@ stop_all() {
     rm -f "$f"
   done
   # 兜底：只杀 XDG_RUNTIME_DIR 指向沙箱的进程，绝不误伤用户自己的桌面
-  for p in $(pgrep -x sway 2>/dev/null) $(pgrep -x wstream 2>/dev/null) \
-           $(pgrep -x sway-nocap 2>/dev/null); do
+  for p in $(own_pids); do
     is_zombie "$p" && continue          # 已经死了，不用管
-    [ -r "/proc/$p/environ" ] || continue
-    rt=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | sed -n 's/^XDG_RUNTIME_DIR=//p')
-    [ "$rt" = "$ROOT/run" ] && kill "$p" 2>/dev/null
+    kill "$p" 2>/dev/null
   done
   # 等它们真的退出（最多 5 秒），别让下一步 start 撞上还没死透的进程
   i=0
   while [ $i -lt 25 ]; do
     busy=""
-    for p in $(pgrep -x wstream 2>/dev/null); do
+    for p in $(own_pids); do
       is_zombie "$p" || busy="$p"
     done
     [ -z "$busy" ] && break
@@ -158,15 +179,20 @@ fi
 # ---------- 2. wstream ----------
 # ⚠️ 判据是「端口真的在服务」，不是「有个叫 wstream 的进程」。
 # 容器里被 kill 的进程会变成僵尸、pgrep 仍能匹配（见 is_zombie 的说明）。
+# ⚠️ 只看**本实例**的进程（$ROOT/run 下的），绝不碰别的实例。
+# 别的 agent 可能正跑着自己的 wstream，全局 pgrep 会把它一起杀掉。
 RUNNING=""
+OWNSELF=""
 for p in $(pgrep -x wstream 2>/dev/null); do
+  belongs_to_root "$p" || continue
+  OWNSELF="$OWNSELF $p"
   if alive "$p"; then RUNNING=1; fi
 done
 if [ -n "$RUNNING" ] && port_serving "$PORT"; then
   log "wstream 已在运行（端口 $PORT 可服务）"
 else
-  # 有进程但不服务 → 僵尸或卡死，先清掉
-  for p in $(pgrep -x wstream 2>/dev/null); do
+  # 本实例有进程但端口不服务 → 僵尸或卡死，只清掉自己的
+  for p in $OWNSELF; do
     kill -9 "$p" 2>/dev/null
   done
   log "启动 wstream（端口 $PORT）…"

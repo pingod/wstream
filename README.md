@@ -38,6 +38,7 @@
 - [性能实测](#性能实测)
 - [隔离性说明](#隔离性说明)
 - [踩过的坑](#踩过的坑)
+- [多实例（多个 agent 各一套桌面）](#多实例多个-agent-各一套桌面)
 - [已知限制](#已知限制)
 - [安全边界](#安全边界)
 - [开发](#开发)
@@ -565,6 +566,61 @@ exec /path/to/desktop.sh
 ### 23. `pkill -f xxx` 会杀掉自己的 shell
 
 因为 bash 的命令行里也包含那个字符串。用 `pgrep -x`（精确匹配进程名）更安全。
+
+---
+
+## 多实例（多个 agent 各一套桌面）
+
+每个实例 = 独立 sway + 独立 wstream + 独立端口，**完全隔离**：
+
+```bash
+WSTREAM_ROOT=/tmp/ws-a WSTREAM_PORT=8801 ./scripts/start.sh
+WSTREAM_ROOT=/tmp/ws-b WSTREAM_PORT=8802 ./scripts/start.sh
+```
+
+| 资源 | 隔离方式 |
+|---|---|
+| 合成器 | 各自 `$ROOT/run/wayland-N` |
+| 窗口 / 输入 / 剪贴板 | 独立 sway 会话，物理隔离 |
+| HTTP / WS 端口 | `WSTREAM_PORT` 各自不同 |
+| 运行时目录 | `WSTREAM_ROOT` 各自一套 |
+
+### 查看多个桌面
+
+**① 各开一个标签页**（推荐，可交互）
+```
+http://127.0.0.1:8801
+http://127.0.0.1:8802
+```
+
+**② 列出所有在跑的实例**
+```bash
+./scripts/list.sh          # 表格：端口 / 状态 / 运行时目录 / URL
+./scripts/list.sh --url    # 只输出 URL，方便脚本消费
+```
+
+**③ 总览页：一屏看全部画面**
+```bash
+./scripts/dashboard.sh     # 生成 /tmp/wstream-dashboard.html
+```
+所有实例的实时 MJPEG 并排成网格。点每张卡片的「打开 ↗」进入可交互页面。
+
+> 总览页只嵌画面、不做交互：各实例的 `Origin` 校验只信任自己端口的页面，
+> 跨端口建不了 WebSocket。但 `<img>` 加载 MJPEG 不带 `Origin`，
+> `Host` 也是回环地址，能通过校验 —— 所以看画面没问题，操作要点进原生页面。
+
+### 单独停止某个实例
+```bash
+WSTREAM_ROOT=/tmp/ws-a ./scripts/start.sh stop
+```
+
+> ⚠️ 必须带 `WSTREAM_ROOT`。不带的话会按默认 `/tmp/wstream` 处理，
+> 停的是另一个实例（或什么都没停）。
+
+### 资源成本
+
+单实例实测（去掉演示终端）：wstream 10 MB + sway 44 MB ≈ **55 MB**。
+十个 agent 约 550 MB。
 
 ---
 
