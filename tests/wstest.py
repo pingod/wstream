@@ -18,11 +18,13 @@
 import base64
 import os
 import re
+import shutil
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 HOST = "127.0.0.1"
@@ -1004,6 +1006,38 @@ def main():
         except Exception as e:
             check("客户端库自动探测分辨率", False, f"(异常={e})")
             check("客户端库扩展头收帧+剪贴板往返", False, f"(异常={e})")
+
+        # 9j2. 前端内联 JS 必须语法正确 + 快捷键下拉的 value 必须与 MODS 键一致。
+        #   ⚠️ 踩过两次：① 箭头函数少花括号 → 整段脚本不执行（状态永远停在
+        #   「连接中…」）；② option value 写成 C/A/S 而 MODS 的键是 Ctrl/Alt/Shift
+        #   → 点「发送」一帧都不发。前端没有浏览器跑 CI，只能做静态校验。
+        page = http_body("/")[1].decode("utf-8", "replace")
+        mjs = re.search(r"<script>(.*?)</script>", page, re.S)
+        js = mjs.group(1) if mjs else ""
+        ok_syntax, syntax_msg = True, "node 不可用，跳过"
+        if js and shutil.which("node"):
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as tf:
+                tf.write(js)
+                jspath = tf.name
+            try:
+                rn = subprocess.run(["node", "--check", jspath],
+                                    capture_output=True, text=True, timeout=20)
+                ok_syntax = rn.returncode == 0
+                syntax_msg = (rn.stderr or "ok").strip()[-160:]
+            finally:
+                os.unlink(jspath)
+        check("前端 JS 语法正确", ok_syntax and bool(js),
+              f"(js={len(js)}B {syntax_msg})")
+
+        # 修饰键下拉的 value 必须能在 MODS 里查到，否则点击静默无效。
+        # ⚠️ 只取 modSel 那一行：keySel 的 value 是 C/V/A/S… 本来就不在 MODS 里。
+        mv = re.search(r"const MODS=\{([^}]*)\}", js)
+        keys_in_mods = set(re.findall(r"(\w+):\d+", mv.group(1))) if mv else set()
+        mm = re.search(r"modSel\.innerHTML='([^']*)'", js)
+        optvals = set(re.findall(r"<option value=(\w+)>", mm.group(1))) if mm else set()
+        missing = optvals - keys_in_mods
+        check("快捷键修饰键 value 与 MODS 一致", bool(optvals) and not missing,
+              f"(options={sorted(optvals)} MODS={sorted(keys_in_mods)} 缺={sorted(missing)})")
 
         # 9k. 隔离护栏：裸 wstream 指向真实登录会话必须拒绝（绝不能抓真实桌面）。
         #     两条都在 wl_display_connect 之前 die，不会真连桌面，安全。
