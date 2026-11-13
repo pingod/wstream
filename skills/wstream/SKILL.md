@@ -293,7 +293,8 @@ WSTREAM_ROOT=/tmp/ws-agent1 ./wstream stop
 
 收工时一次全停（不用记有哪些实例）：
 ```bash
-./wstream stop-all --yes
+./wstream stop-all --yes     # 只停当前 WSTREAM_ROOT 的实例
+./wstream stop-all --yes --all   # 真·全部实例
 ```
 
 ### 方式 B：在沙箱里直接跑命令（更简单）

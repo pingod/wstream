@@ -781,11 +781,16 @@ static int instance_root_of(pid_t pid, char *root, size_t cap) {
 }
 
 static int cmd_stop_all(int argc, char **argv) {
-    int assume_yes = 0, dry_run = 0;
+    int assume_yes = 0, dry_run = 0, all_insts = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--yes")) assume_yes = 1;
         else if (!strcmp(argv[i], "--dry-run")) dry_run = 1;
+        else if (!strcmp(argv[i], "--all")) all_insts = 1;
     }
+    /* ⚠️ 设了 WSTREAM_ROOT 就只停这个实例：测试脚本用 stop-all 清理自己时，
+     * 绝不能顺手停掉用户正在看的另一个实例（踩过：跑 lifecycle 把 8765 停了）。 */
+    const char *only_root = getenv("WSTREAM_ROOT");
+    if (only_root && !*only_root) only_root = NULL;
     static struct inst insts[64];
     int ninst = 0;
     for (int a = 0; STOPALL_APPS[a]; a++) {
@@ -795,6 +800,7 @@ static int cmd_stop_all(int argc, char **argv) {
             if (is_zombie(pids[i])) continue;
             char root[512];
             if (instance_root_of(pids[i], root, sizeof root) < 0) continue;
+            if (only_root && !all_insts && strcmp(root, only_root)) continue;
             int idx = -1;
             for (int j = 0; j < ninst; j++)
                 if (!strcmp(insts[j].root, root)) { idx = j; break; }
@@ -977,7 +983,8 @@ static void usage(void) {
         "                             多实例：重复 start 自动新建；显式 WSTREAM_ROOT/WSTREAM_PORT 复用指定实例\n"
         "  wstream stop               停止本实例（WSTREAM_ROOT 指定，默认 /tmp/wstream）\n"
         "  wstream list [--url] [-p PORT]   列出运行中的实例\n"
-        "  wstream stop-all [--yes] [--dry-run]   停止所有实例\n"
+        "  wstream stop-all [--yes] [--dry-run] [--all]\n"
+        "                             停止实例：设了 WSTREAM_ROOT 只停该实例；--all 停全部\n"
         "  wstream dashboard [-o OUT]  生成所有实例的总览页面\n"
         "  wstream stream [-p PORT] [-f FPS] [-q QUALITY] [-s FILE.ppm] [--verbose]\n"
         "                             纯推流客户端（连接 WAYLAND_DISPLAY 指向的合成器）\n"
@@ -1009,14 +1016,16 @@ int instance_main(int argc, char **argv) {
         }
         if (!valid_size(size)) idie("分辨率格式应为 WxH（如 1600x1000），收到：%s", size);
         if (port < 1 || port > 65535) idie("端口越界（1..65535）：%d", port);
-        /* 多实例：未显式指定 WSTREAM_ROOT/WSTREAM_PORT 时，若默认实例已占用，
-         * 自动新建实例（/tmp/wstream-2、-3… + 顺延端口），让重复 `wstream start`
-         * 能同时跑多个。显式指定 root/port 时保持原复用语义（幂等）。 */
-        char auto_root[64];
-        if ((!getenv("WSTREAM_ROOT") || !*getenv("WSTREAM_ROOT")) && (!ports || !*ports)) {
+        /* 多实例：**既没设 WSTREAM_ROOT 也没设 WSTREAM_PORT** 时，若目标实例已占用，
+         * 自动新建实例（<base>-2、-3… + 顺延端口）。显式指定任一者时保持复用语义。
+         * ⚠️ 基名仍取 DEFAULT_ROOT —— 显式 root 表示「就要这个实例」。 */
+        char auto_root[128];
+        int port_explicit = (ports && *ports);
+        int root_explicit = (getenv("WSTREAM_ROOT") && *getenv("WSTREAM_ROOT"));
+        if (!root_explicit && !port_explicit) {
             int i;
             for (i = 0; i < 100; i++) {
-                char cand[64], wl[256];
+                char cand[128], wl[256];
                 if (i == 0) snprintf(cand, sizeof cand, "%s", DEFAULT_ROOT);
                 else snprintf(cand, sizeof cand, "%s-%d", DEFAULT_ROOT, i + 1);
                 int root_busy = (find_wl_socket(cand, wl, sizeof wl) == 0 &&

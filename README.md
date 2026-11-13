@@ -649,6 +649,7 @@ WSTREAM_ROOT=/tmp/ws-a ./wstream stop
 ./wstream stop-all             # 列出要停的实例，确认后执行
 ./wstream stop-all --yes       # 不确认（CI / 脚本用）
 ./wstream stop-all --dry-run   # 只列不停
+./wstream stop-all --all       # 停**所有**实例（默认只停 WSTREAM_ROOT 指定的那个）
 ```
 
 `wstream stop-all` 的安全设计：只按 **XDG_RUNTIME_DIR 归属**判断，绝不按进程名裸杀

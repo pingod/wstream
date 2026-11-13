@@ -116,6 +116,9 @@ def main():
 
     root = "/tmp/wstream-lc-test"
     port = 8834
+    # 进来第一件事：记下默认实例位是否已被占用（很可能是用户正在看的 8765）。
+    # 必须在这里采样 —— 后面的用例会把 8765 停掉，那时再判断就晚了。
+    default_busy_at_start = port_http(8765) == 200
     print("── 0. 清理上次残留 ──")
     run_stop(root)
     shutil.rmtree(root, ignore_errors=True)
@@ -192,8 +195,11 @@ def main():
 
         # 故意删掉实例目录，模拟「目录没了但进程还在」——坑 27
         shutil.rmtree(root, ignore_errors=True)
-        r = subprocess.run([BIN, "stop-all", "--yes"], capture_output=True, text=True,
-                           timeout=120)
+        # ⚠️ 不能用 --all：那会连带停掉用户正在看的默认实例。
+        # 目录虽被删，但进程的 XDG_RUNTIME_DIR 仍指向 root，按 root 过滤能找到。
+        r = subprocess.run([BIN, "stop-all", "--yes"],
+                           env=dict(os.environ, WSTREAM_ROOT=root),
+                           capture_output=True, text=True, timeout=120)
         check("stop-all 成功返回", r.returncode == 0, r.stderr[-300:])
         time.sleep(2)
 
@@ -236,23 +242,35 @@ def main():
     shutil.rmtree(aroot, ignore_errors=True)
 
     # ---------- 6. 多实例：裸 start 重复运行自动新建 ----------
+    # ⚠️ 自动新建只在「默认根 /tmp/wstream + 8765」上发生，无法用临时 root 隔离。
+    #    若用户此刻正在看 8765（非测试进程占用），跳过本节 —— 不能为了测试把
+    #    用户正在用的实例停掉。CI 里没有用户实例，本节照常跑。
     print("── 6. 多实例自动分配（裸 start 重复运行）──")
-    subprocess.run([BIN, "stop-all", "--yes"], capture_output=True, timeout=120)
-    clean_env = {k: v for k, v in os.environ.items()
-                 if k not in ("WSTREAM_ROOT", "WSTREAM_PORT")}
-    r1 = subprocess.run([BIN, "start", "1024x600"], env=clean_env,
-                        capture_output=True, text=True, timeout=120)
-    check("多实例: 第1个实例起来", r1.returncode == 0, r1.stderr[-200:])
-    r2 = subprocess.run([BIN, "start", "1024x600"], env=clean_env,
-                        capture_output=True, text=True, timeout=120)
-    check("多实例: 第2个自动新建", r2.returncode == 0 and "自动新建" in (r2.stdout + r2.stderr),
-          f"(输出={(r2.stdout + r2.stderr)[-200:]})")
-    check("多实例: 8765 在线", port_http(8765) == 200)
-    check("多实例: 8766 在线", port_http(8766) == 200)
-    subprocess.run([BIN, "stop-all", "--yes"], capture_output=True, timeout=120)
-    time.sleep(1)
-    check("多实例: stop-all 后全部清空",
-          port_http(8765) is None and port_http(8766) is None)
+    skip6 = default_busy_at_start and not os.environ.get("WSTREAM_TEST_TAKE_8765")
+    if skip6:
+        print("     ⏭ 跳过（8765 上有实例在服务，可能是用户正在看的；"
+              "要强制跑设 WSTREAM_TEST_TAKE_8765=1）")
+    if not skip6:
+        # 到这里 8765 是空闲的（否则上面已跳过），可以安全占用默认实例位。
+        # 自动分配只在「默认根 + 8765」触发，所以本节必须用默认根才测得到。
+        menv = {k: v for k, v in os.environ.items()
+                if k not in ("WSTREAM_ROOT", "WSTREAM_PORT")}
+        r1 = subprocess.run([BIN, "start", "1024x600"], env=menv,
+                            capture_output=True, text=True, timeout=120)
+        check("多实例: 第1个实例起来", r1.returncode == 0, r1.stderr[-200:])
+        r2 = subprocess.run([BIN, "start", "1024x600"], env=menv,
+                            capture_output=True, text=True, timeout=120)
+        check("多实例: 第2个自动新建", r2.returncode == 0 and "自动新建" in (r2.stdout + r2.stderr),
+              f"(输出={(r2.stdout + r2.stderr)[-200:]})")
+        ports = [8765, 8766]
+        online = [p for p in ports if port_http(p) == 200]
+        check("多实例: 两个实例都在线", len(online) == 2, f"(在线={online})")
+        subprocess.run([BIN, "stop-all", "--yes", "--all"], capture_output=True, timeout=120)
+        time.sleep(1)
+        check("多实例: stop-all 后本组清空",
+              all(port_http(p) is None for p in ports), f"(仍在线={[p for p in ports if port_http(p)]})")
+        shutil.rmtree("/tmp/wstream", ignore_errors=True)
+        shutil.rmtree("/tmp/wstream-2", ignore_errors=True)
 
     print()
     print(f"通过 {len(PASSES)} 项，失败 {len(FAILS)} 项")
