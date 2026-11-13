@@ -10,6 +10,9 @@
   不指定时默认开「交互命令行 + 实时计数器」两个窗口（原先是两个计数器）。
 - `stop`/`stop-all` 清理改为按 `XDG_RUNTIME_DIR` 归属（不限进程名），`--app` 启动的
   任意程序及其子进程都能收掉；stop 增加超时强杀。lifecycle 增 `--app` 回归（第 5 节）。
+- **多实例自动分配**：未显式指定 `WSTREAM_ROOT`/`WSTREAM_PORT` 时，重复 `wstream start`
+  会自动新建实例（`/tmp/wstream-2`、`-3`… + 顺延端口），不再只复用默认实例；显式指定
+  root/port 仍保持幂等复用。lifecycle 增多实例回归（第 6 节）。
 
 ## [0.2] - 2026-11-13
 

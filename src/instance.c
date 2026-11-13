@@ -742,7 +742,7 @@ static int cmd_list(int argc, char **argv) {
     if (!found && !url_only) {
         ilog("没有正在运行的实例");
         ilog("  启动一个：  wstream start");
-        ilog("  多实例：    WSTREAM_ROOT=/tmp/ws-a WSTREAM_PORT=8801 wstream start");
+        ilog("  多实例：    重复 wstream start 自动新建；或 WSTREAM_ROOT=/tmp/ws-a WSTREAM_PORT=8801 wstream start");
     }
     return 0;
 }
@@ -975,6 +975,7 @@ static void usage(void) {
         "用法：\n"
         "  wstream start [WxH] [--app/-A 程序]  起隔离沙箱并推流（默认 1600x1000，端口 8765）\n"
         "                             --app/-A：沙箱打开指定程序；默认开命令行+计数器两窗口\n"
+        "                             多实例：重复 start 自动新建；显式 WSTREAM_ROOT/WSTREAM_PORT 复用指定实例\n"
         "  wstream stop               停止本实例（WSTREAM_ROOT 指定，默认 /tmp/wstream）\n"
         "  wstream list [--url] [-p PORT]   列出运行中的实例\n"
         "  wstream stop-all [--yes] [--dry-run]   停止所有实例\n"
@@ -1009,6 +1010,28 @@ int instance_main(int argc, char **argv) {
         }
         if (!valid_size(size)) idie("分辨率格式应为 WxH（如 1600x1000），收到：%s", size);
         if (port < 1 || port > 65535) idie("端口越界（1..65535）：%d", port);
+        /* 多实例：未显式指定 WSTREAM_ROOT/WSTREAM_PORT 时，若默认实例已占用，
+         * 自动新建实例（/tmp/wstream-2、-3… + 顺延端口），让重复 `wstream start`
+         * 能同时跑多个。显式指定 root/port 时保持原复用语义（幂等）。 */
+        char auto_root[64];
+        if ((!getenv("WSTREAM_ROOT") || !*getenv("WSTREAM_ROOT")) && (!ports || !*ports)) {
+            int i;
+            for (i = 0; i < 100; i++) {
+                char cand[64], wl[256];
+                if (i == 0) snprintf(cand, sizeof cand, "%s", DEFAULT_ROOT);
+                else snprintf(cand, sizeof cand, "%s-%d", DEFAULT_ROOT, i + 1);
+                int root_busy = (find_wl_socket(cand, wl, sizeof wl) == 0 &&
+                                 sandbox_alive(cand, wl));
+                if (!root_busy && !port_serving(DEFAULT_PORT + i)) break;
+            }
+            if (i >= 100) idie("实例数过多，无法自动分配；请用 WSTREAM_ROOT/WSTREAM_PORT 显式指定");
+            if (i > 0) {
+                snprintf(auto_root, sizeof auto_root, "%s-%d", DEFAULT_ROOT, i + 1);
+                root = auto_root;
+                port = DEFAULT_PORT + i;
+                ilog("默认实例已占用，自动新建实例 %s（端口 %d）", root, port);
+            }
+        }
         return start_instance(root, port, size, app);
     }
     if (!strcmp(cmd, "stop")) return stop_instance(root);

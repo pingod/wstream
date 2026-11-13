@@ -235,6 +235,25 @@ def main():
     check("--app stop 零残留（按归属，不限名）", len(left) == 0, f"(残留={left})")
     shutil.rmtree(aroot, ignore_errors=True)
 
+    # ---------- 6. 多实例：裸 start 重复运行自动新建 ----------
+    print("── 6. 多实例自动分配（裸 start 重复运行）──")
+    subprocess.run([BIN, "stop-all", "--yes"], capture_output=True, timeout=120)
+    clean_env = {k: v for k, v in os.environ.items()
+                 if k not in ("WSTREAM_ROOT", "WSTREAM_PORT")}
+    r1 = subprocess.run([BIN, "start", "1024x600"], env=clean_env,
+                        capture_output=True, text=True, timeout=120)
+    check("多实例: 第1个实例起来", r1.returncode == 0, r1.stderr[-200:])
+    r2 = subprocess.run([BIN, "start", "1024x600"], env=clean_env,
+                        capture_output=True, text=True, timeout=120)
+    check("多实例: 第2个自动新建", r2.returncode == 0 and "自动新建" in (r2.stdout + r2.stderr),
+          f"(输出={(r2.stdout + r2.stderr)[-200:]})")
+    check("多实例: 8765 在线", port_http(8765) == 200)
+    check("多实例: 8766 在线", port_http(8766) == 200)
+    subprocess.run([BIN, "stop-all", "--yes"], capture_output=True, timeout=120)
+    time.sleep(1)
+    check("多实例: stop-all 后全部清空",
+          port_http(8765) is None and port_http(8766) is None)
+
     print()
     print(f"通过 {len(PASSES)} 项，失败 {len(FAILS)} 项")
     if FAILS:

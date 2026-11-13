@@ -598,6 +598,9 @@ WSTREAM_ROOT=/tmp/ws-a WSTREAM_PORT=8801 ./wstream start
 WSTREAM_ROOT=/tmp/ws-b WSTREAM_PORT=8802 ./wstream start
 ```
 
+更省事：直接**重复 `./wstream start`**——默认实例被占用时会自动新建（`/tmp/wstream-2`、`-3`…
+并顺延端口 8766、8767…），无需手动指定。显式 `WSTREAM_ROOT`/`WSTREAM_PORT` 则复用/指定实例（幂等）。
+
 | 资源 | 隔离方式 |
 |---|---|
 | 合成器 | 各自 `$ROOT/run/wayland-N` |

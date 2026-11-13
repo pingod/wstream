@@ -262,6 +262,9 @@ WSTREAM_ROOT=/tmp/ws-agent1 WSTREAM_PORT=8801 ./wstream start
 WSTREAM_ROOT=/tmp/ws-agent2 WSTREAM_PORT=8802 ./wstream start
 ```
 
+更省事：直接重复 `./wstream start`，默认实例被占用时自动新建（`/tmp/wstream-2`… + 端口顺延），
+用 `./wstream list` 看各实例端口。
+
 然后各用各的端口：
 
 ```python
