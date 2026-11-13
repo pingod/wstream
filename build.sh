@@ -2,7 +2,7 @@
 # build.sh — 从协议 XML 生成 C 代码并编译 wstream
 #
 # 依赖（Arch / CachyOS）：
-#   sudo pacman -S --needed gcc pkgconf wayland libjpeg-turbo libxkbcommon wlr-protocols
+#   sudo pacman -S --needed gcc pkgconf wayland libjpeg-turbo libxkbcommon wlr-protocols x264
 set -eu
 cd "$(dirname "$0")"
 mkdir -p proto

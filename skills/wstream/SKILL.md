@@ -54,7 +54,7 @@ cd ~/githome/wstream          # 或任何 clone 下来的位置
 
 ```bash
 sudo pacman -S --needed gcc pkgconf wayland libjpeg-turbo libxkbcommon \
-    wlr-protocols sway grim
+    wlr-protocols sway grim x264
 ```
 
 ---

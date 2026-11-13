@@ -111,6 +111,7 @@ cd wstream
 | `libwayland-client` | Wayland 客户端 | `wayland` |
 | `libjpeg-turbo` | JPEG 编码 | `libjpeg-turbo` |
 | `libxkbcommon` | keymap 生成 | `libxkbcommon` |
+| `x264` | H.264 编码（`?video=h264`） | `x264` |
 | `wlr-protocols` | screencopy / virtual-pointer 协议 XML | `wlr-protocols` |
 | `sway` | 沙箱合成器 | `sway` |
 
@@ -124,7 +125,7 @@ gcc pkgconf wayland-scanner
 
 ```bash
 sudo pacman -S --needed gcc pkgconf wayland wayland-protocols \
-    libjpeg-turbo libxkbcommon wlr-protocols sway
+    libjpeg-turbo libxkbcommon wlr-protocols sway x264
 ```
 
 > **为什么用 sway 而不是 labwc？**
