@@ -20,13 +20,15 @@ gen "$PROTO/wlr-virtual-pointer-unstable-v1.xml" wlr-virtual-pointer
 # 剪贴板同步：data-control 是给「剪贴板管理器」用的协议，
 # 不需要 surface 有焦点 —— 这正是无头沙箱里能读写剪贴板的原因。
 gen "$PROTO/wlr-data-control-unstable-v1.xml"    wlr-data-control
+# 输出尺寸动态缩放（与 wlr-randr 同源协议）
+gen "$PROTO/wlr-output-management-unstable-v1.xml" wlr-output-management
 
 # virtual-keyboard 的 XML 不在任何发行包里，随源码带一份
 gen protocols/virtual-keyboard-unstable-v1.xml   virtual-keyboard
 
 gcc -O2 -g -Wall -Wextra -o wstream src/wstream.c src/instance.c \
     proto/wlr-screencopy.c proto/wlr-virtual-pointer.c proto/virtual-keyboard.c \
-    proto/wlr-data-control.c \
+    proto/wlr-data-control.c proto/wlr-output-management.c \
     -Iproto $(pkg-config --cflags --libs wayland-client libturbojpeg xkbcommon) -lpthread
 
 echo "✅ 编译完成：$(pwd)/wstream"

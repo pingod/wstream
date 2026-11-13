@@ -55,6 +55,7 @@
 #include "wlr-virtual-pointer.h"
 #include "virtual-keyboard.h"
 #include "wlr-data-control.h"
+#include "wlr-output-management.h"
 #include "instance.h"
 
 /* ============================================================ 基础工具 */
@@ -167,6 +168,13 @@ struct capture {
     struct zwlr_data_control_manager_v1 *dc_mgr;
     struct zwlr_data_control_device_v1  *dc_dev;
 
+    /* 输出尺寸（output-management 协议，动态缩放） */
+    struct zwlr_output_manager_v1 *out_mgr;
+    struct zwlr_output_head_v1    *out_head;   /* 首个 head（无头沙箱只有一个） */
+    uint32_t out_serial;                        /* 最近一次 manager.done 的 serial */
+    int      head_enabled;
+    int      head_mode_w, head_mode_h;
+
     int frame_ready, frame_failed;
     int probed;      /* 是否已经做过 shm 格式 roundtrip */
     int fb_w, fb_h;
@@ -181,6 +189,87 @@ static const struct wl_shm_listener shm_listener = { shm_format };
 static void seat_caps(void *d, struct wl_seat *s, uint32_t c) { (void)d; (void)s; (void)c; }
 static void seat_name(void *d, struct wl_seat *s, const char *n) { (void)d; (void)s; (void)n; }
 static const struct wl_seat_listener seat_listener = { seat_caps, seat_name };
+
+/* ---------- output-management：动态调整输出尺寸（参考 waymote 的 observe 模式） ---------- */
+static volatile int g_resize_w, g_resize_h, g_resize_dirty;
+
+static void om_mode_size(void *d, struct zwlr_output_mode_v1 *m, int32_t w, int32_t h) { (void)d;(void)m;(void)w;(void)h; }
+static void om_mode_refresh(void *d, struct zwlr_output_mode_v1 *m, int32_t r) { (void)d;(void)m;(void)r; }
+static void om_mode_preferred(void *d, struct zwlr_output_mode_v1 *m) { (void)d;(void)m; }
+static void om_mode_finished(void *d, struct zwlr_output_mode_v1 *m) { (void)d;(void)m; }
+static const struct zwlr_output_mode_v1_listener om_mode_listener = {
+    .size = om_mode_size, .refresh = om_mode_refresh,
+    .preferred = om_mode_preferred, .finished = om_mode_finished,
+};
+
+static void om_head_name(void *d, struct zwlr_output_head_v1 *h, const char *n) { (void)d;(void)h;(void)n; }
+static void om_head_desc(void *d, struct zwlr_output_head_v1 *h, const char *s) { (void)d;(void)h;(void)s; }
+static void om_head_phys(void *d, struct zwlr_output_head_v1 *h, int32_t w, int32_t hh) { (void)d;(void)h;(void)w;(void)hh; }
+static void om_head_mode(void *d, struct zwlr_output_head_v1 *h, struct zwlr_output_mode_v1 *m) {
+    (void)d; (void)h;
+    zwlr_output_mode_v1_add_listener(m, &om_mode_listener, NULL);
+}
+static void om_head_enabled(void *d, struct zwlr_output_head_v1 *h, int32_t e) {
+    (void)d; (void)h; cap.head_enabled = e != 0;
+}
+static void om_head_cur_mode(void *d, struct zwlr_output_head_v1 *h, struct zwlr_output_mode_v1 *m) { (void)d;(void)h;(void)m; }
+static void om_head_pos(void *d, struct zwlr_output_head_v1 *h, int32_t x, int32_t y) { (void)d;(void)h;(void)x;(void)y; }
+static void om_head_transform(void *d, struct zwlr_output_head_v1 *h, int32_t t) { (void)d;(void)h;(void)t; }
+static void om_head_scale(void *d, struct zwlr_output_head_v1 *h, wl_fixed_t s) { (void)d;(void)h;(void)s; }
+static void om_head_finished(void *d, struct zwlr_output_head_v1 *h) { (void)d; (void)h; }
+static void om_head_make(void *d, struct zwlr_output_head_v1 *h, const char *s) { (void)d;(void)h;(void)s; }
+static void om_head_model(void *d, struct zwlr_output_head_v1 *h, const char *s) { (void)d;(void)h;(void)s; }
+static void om_head_serial(void *d, struct zwlr_output_head_v1 *h, const char *s) { (void)d;(void)h;(void)s; }
+static void om_head_adapt(void *d, struct zwlr_output_head_v1 *h, uint32_t s) { (void)d;(void)h;(void)s; }
+static const struct zwlr_output_head_v1_listener om_head_listener = {
+    .name = om_head_name, .description = om_head_desc, .physical_size = om_head_phys,
+    .mode = om_head_mode, .enabled = om_head_enabled, .current_mode = om_head_cur_mode,
+    .position = om_head_pos, .transform = om_head_transform, .scale = om_head_scale,
+    .finished = om_head_finished, .make = om_head_make, .model = om_head_model,
+    .serial_number = om_head_serial, .adaptive_sync = om_head_adapt,
+};
+
+static void om_cfg_succeeded(void *d, struct zwlr_output_configuration_v1 *cfg) { (void)d; zwlr_output_configuration_v1_destroy(cfg); }
+static void om_cfg_failed(void *d, struct zwlr_output_configuration_v1 *cfg) { (void)d; logf_("⚠️ 输出尺寸调整失败"); zwlr_output_configuration_v1_destroy(cfg); }
+static void om_cfg_cancelled(void *d, struct zwlr_output_configuration_v1 *cfg) { (void)d; logf_("⚠️ 输出尺寸调整被取消"); zwlr_output_configuration_v1_destroy(cfg); }
+static const struct zwlr_output_configuration_v1_listener om_cfg_listener = {
+    .succeeded = om_cfg_succeeded, .failed = om_cfg_failed, .cancelled = om_cfg_cancelled,
+};
+
+static void om_mgr_head(void *d, struct zwlr_output_manager_v1 *m, struct zwlr_output_head_v1 *head) {
+    (void)d; (void)m;
+    if (!cap.out_head) {   /* 只配置首个 head（无头沙箱只有一个输出） */
+        cap.out_head = head;
+        zwlr_output_head_v1_add_listener(head, &om_head_listener, NULL);
+    }
+}
+static void om_mgr_done(void *d, struct zwlr_output_manager_v1 *m, uint32_t serial) {
+    (void)d; (void)m; cap.out_serial = serial;
+}
+static void om_mgr_finished(void *d, struct zwlr_output_manager_v1 *m) { (void)d; (void)m; }
+static const struct zwlr_output_manager_v1_listener om_mgr_listener = {
+    .head = om_mgr_head, .done = om_mgr_done, .finished = om_mgr_finished,
+};
+
+/* 应用新的输出尺寸。仅在主线程调用（会 roundtrip）。 */
+static void resize_output(int w, int h) {
+    if (!cap.out_mgr || !cap.out_head || !cap.out_serial) {
+        logf_("⚠️ 合成器不支持动态输出尺寸（无 output-management）");
+        return;
+    }
+    if (w < 64 || h < 64 || w > 16384 || h > 16384) return;
+    struct zwlr_output_configuration_v1 *cfg =
+        zwlr_output_manager_v1_create_configuration(cap.out_mgr, cap.out_serial);
+    if (!cfg) return;
+    struct zwlr_output_configuration_head_v1 *ch =
+        zwlr_output_configuration_v1_enable_head(cfg, cap.out_head);
+    if (!ch) { zwlr_output_configuration_v1_destroy(cfg); return; }
+    zwlr_output_configuration_head_v1_set_custom_mode(ch, w, h, 0);
+    zwlr_output_configuration_v1_add_listener(cfg, &om_cfg_listener, NULL);
+    zwlr_output_configuration_v1_apply(cfg);
+    wl_display_roundtrip(cap.display);
+    if (g_verbose) logf_("🖥️ 输出尺寸 → %dx%d", w, h);
+}
 
 static void on_global(void *data, struct wl_registry *reg, uint32_t name,
                       const char *iface, uint32_t version) {
@@ -204,6 +293,10 @@ static void on_global(void *data, struct wl_registry *reg, uint32_t name,
     } else if (!strcmp(iface, zwlr_data_control_manager_v1_interface.name)) {
         c->dc_mgr = wl_registry_bind(reg, name, &zwlr_data_control_manager_v1_interface,
                                      version < 1 ? version : 1);
+    } else if (!strcmp(iface, zwlr_output_manager_v1_interface.name)) {
+        c->out_mgr = wl_registry_bind(reg, name, &zwlr_output_manager_v1_interface,
+                                      version < 4 ? version : 4);
+        zwlr_output_manager_v1_add_listener(c->out_mgr, &om_mgr_listener, c);
     }
 }
 static void on_global_remove(void *d, struct wl_registry *r, uint32_t n) { (void)d; (void)r; (void)n; }
@@ -1140,7 +1233,7 @@ static const char INDEX_HTML[] =
     "function conn(){\n"
     "  ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');\n"
     "  ws.binaryType='arraybuffer';\n"
-    "  ws.onopen=()=>{st.textContent='画面 + 输入已连接';st.style.color='#4ade80';};\n"
+    "  ws.onopen=()=>{st.textContent='画面 + 输入已连接';st.style.color='#4ade80';setTimeout(fitViewport,200);};\n"
     "  ws.onmessage=ev=>{\n"
     "    const b=new Uint8Array(ev.data);\n"
     "    if(b.length<8)return;\n"
@@ -1167,6 +1260,17 @@ static const char INDEX_HTML[] =
     "  dv.setUint16(4,a&0xffff,true);dv.setUint16(6,b&0xffff,true);\n"
     "  ws.send(bf);\n"
     "}\n"
+    "/* 输出尺寸 observe 模式：浏览器视口变化时请求远端输出匹配（参考 waymote）。\n"
+    " * type 9 = 请求宽高（像素）。去抖 500ms，变化 <32px 忽略。 */\n"
+    "let _rszT=null,_lastW=0,_lastH=0;\n"
+    "function fitViewport(){\n"
+    "  if(!ws||ws.readyState!==1)return;\n"
+    "  const w=Math.max(640,Math.min(3840,Math.round(window.innerWidth)));\n"
+    "  const h=Math.max(480,Math.min(2160,Math.round(window.innerHeight-48)));\n"
+    "  if(Math.abs(w-_lastW)<32&&Math.abs(h-_lastH)<32)return;\n"
+    "  _lastW=w;_lastH=h; send(9,w,h);\n"
+    "}\n"
+    "window.addEventListener('resize',()=>{clearTimeout(_rszT);_rszT=setTimeout(fitViewport,500);});\n"
     "/* type 5：8 字节头 + UTF-8 负载。中文/emoji 等非 ASCII 走这条。\n"
     " * 服务端收到后换 keymap 注入，见 inject_text()。 */\n"
     "function sendText(t){\n"
@@ -2138,6 +2242,13 @@ static void handle_msg(unsigned long caller_id, const uint8_t *m, size_t n) {
         g_clip_dirty = 1;
         return;
     }
+    if (type == 9) {
+        /* 动态输出尺寸（viewport 驱动）：任何客户端都可请求，改的是共享视图 */
+        g_resize_w = (int)((m[4]) | (m[5] << 8));
+        g_resize_h = (int)((m[6]) | (m[7] << 8));
+        g_resize_dirty = 1;
+        return;
+    }
 
     /* ---------- 输入帧：必须持有输入权 ---------- */
     /* ⚠️ 在前端隐藏按钮是不够的：任何脚本都能直接连 /ws 发帧。
@@ -2604,6 +2715,36 @@ static int stream_main(int argc, char **argv) {
     long dropped = 0;
 
     while (g_run) {
+        if (g_resize_dirty) {
+            g_resize_dirty = 0;
+            resize_output(g_resize_w, g_resize_h);
+            wl_display_roundtrip(cap.display);
+            /* 重新探测实际尺寸：只等 buffer 事件、不 copy（copy 尺寸不符是致命协议错误），
+             * 再按新尺寸重建抓帧缓冲后才能继续 copy。 */
+            cap.fb_w = 0; cap.fb_h = 0; cap.frame_ready = 0;
+            struct zwlr_screencopy_frame_v1 *pfr =
+                zwlr_screencopy_manager_v1_capture_output(cap.mgr, 1, cap.output);
+            zwlr_screencopy_frame_v1_add_listener(pfr, &frame_listener, &cap);
+            while (cap.fb_w <= 0 && g_run) {
+                if (wl_display_dispatch(cap.display) < 0) { g_run = 0; break; }
+            }
+            zwlr_screencopy_frame_v1_destroy(pfr);
+            if (cap.fb_w > 0 && (cap.fb_w != W || cap.fb_h != H)) {
+                for (int i = 0; i < 2; i++) {
+                    wl_buffer_destroy(fb[i].wl_buf);
+                    munmap(fb[i].addr, fb[i].size);
+                    close(fb[i].fd);
+                }
+                W = cap.fb_w; H = cap.fb_h;
+                g_width = W; g_height = H;
+                if (create_shmbuf(&cap, &fb[0], W, H, cap.fb_format) < 0 ||
+                    create_shmbuf(&cap, &fb[1], W, H, cap.fb_format) < 0)
+                    die("重建共享内存失败");
+                cur = 0;
+                logf_("输出尺寸已调整为 %dx%d", W, H);
+            }
+            if (!g_run) break;
+        }
         /* 发起抓帧 */
         struct zwlr_screencopy_frame_v1 *fr =
             zwlr_screencopy_manager_v1_capture_output(cap.mgr, 1, cap.output);
