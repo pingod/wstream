@@ -1344,6 +1344,14 @@ static const char INDEX_HTML[] =
     "  dv.setUint16(4,a&0xffff,true);dv.setUint16(6,b&0xffff,true);\n"
     "  ws.send(bf);\n"
     "}\n"
+    "/* 非 ASCII 可打印字符（é/ñ/ü…）：把浏览器解析出的码点直传，不受键盘布局影响 */\n"
+    "function _nonAsciiKey(e){const k=e.key;if(!k||k.length!==1)return 0;const cp=k.codePointAt(0);return cp>127?cp:0;}\n"
+    "function sendKeySym(ev,cp){\n"
+    "  if(!ws||ws.readyState!==1)return;\n"
+    "  const bf=new Uint8Array(12),dv=new DataView(bf.buffer);\n"
+    "  dv.setUint8(0,11);dv.setUint16(4,ev&0xffff,true);dv.setUint16(6,1,true);dv.setUint32(8,cp,true);\n"
+    "  ws.send(bf);\n"
+    "}\n"
     "/* 输出尺寸 observe 模式：浏览器视口变化时请求远端输出匹配（参考 waymote）。\n"
     " * type 9 = 请求宽高（像素）。去抖 500ms，变化 <32px 忽略。 */\n"
     "let _rszT=null,_lastW=0,_lastH=0;\n"
@@ -1442,10 +1450,13 @@ static const char INDEX_HTML[] =
     "  if((e.ctrlKey||e.metaKey)&&(e.key==='v'||e.key==='V')){e.preventDefault();return;}\n"
     "  e.preventDefault();\n"
     "  const c=evdev(e);if(!c)return;\n"
+    "  const cp=_nonAsciiKey(e);\n"
+    "  if(cp){ if(!e.repeat)sendKeySym(c,cp); return; }   /* 非 ASCII 可打印：直传 keysym */\n"
     "  if(!e.repeat)send(4,c,1);\n"
     "});\n"
     "k.addEventListener('keyup',e=>{\n"
     "  if(!active||composing)return;e.preventDefault();\n"
+    "  if(_nonAsciiKey(e))return;   /* keysym 在 keydown 已落地 */\n"
     "  const c=evdev(e);if(c)send(4,c,0);\n"
     "});\n"
     "/* ---------- 剪贴板 ---------- */\n"
@@ -2414,6 +2425,22 @@ static void handle_msg(unsigned long caller_id, const uint8_t *m, size_t n) {
             last_warn = t;
             logf_("⛔ 忽略无输入权的客户端 %lu 的输入事件（当前持有者=%lu）",
                   caller_id, g_owner);
+        }
+        return;
+    }
+
+    if (type == 11) {
+        /* keysym 直传：浏览器解析的非 ASCII 码点，走 Unicode 注入（主线程） */
+        if (n >= 12) {
+            uint32_t cp = (uint32_t)m[8] | ((uint32_t)m[9] << 8) |
+                          ((uint32_t)m[10] << 16) | ((uint32_t)m[11] << 24);
+            if (cp > 0x7F && cp <= 0x10FFFF) {
+                char u[4]; int ul;
+                if (cp < 0x800) { u[0] = (char)(0xC0 | (cp >> 6)); u[1] = (char)(0x80 | (cp & 0x3F)); ul = 2; }
+                else if (cp < 0x10000) { u[0] = (char)(0xE0 | (cp >> 12)); u[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); u[2] = (char)(0x80 | (cp & 0x3F)); ul = 3; }
+                else { u[0] = (char)(0xF0 | (cp >> 18)); u[1] = (char)(0x80 | ((cp >> 12) & 0x3F)); u[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); u[3] = (char)(0x80 | (cp & 0x3F)); ul = 4; }
+                if (text_enqueue(u, (size_t)ul) == 0) g_input_dirty = 1;
+            }
         }
         return;
     }

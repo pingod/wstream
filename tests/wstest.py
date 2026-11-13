@@ -731,6 +731,20 @@ def main():
                   f"(终端文件内容={content!r})")
             check("中文前后 ASCII 都正常", "ab" in content,
                   f"(终端文件内容={content!r})")
+            # 5b. keysym 直传：非 ASCII 可打印字符（é）不受键盘布局影响
+            _ws_frame(s, bytes([11, 0, 0, 0]) + struct.pack("<HHI", 0, 1, 0xE9))
+            time.sleep(0.4)
+            ws_send(s, 4, 28, 1); ws_send(s, 4, 28, 0)   # Enter
+            time.sleep(1.5)
+            ksym_content = ""
+            for _ in range(20):
+                if os.path.exists(typed):
+                    ksym_content = open(typed, "rb").read().decode("utf-8", "replace")
+                    if "é" in ksym_content:
+                        break
+                time.sleep(0.2)
+            check("keysym 直传（é）到达终端", "é" in ksym_content,
+                  f"(终端文件内容={ksym_content!r})")
         else:
             check("中文注入到达终端", False, "(终端窗口没起来)")
             check("中文前后 ASCII 都正常", False, "(终端窗口没起来)")

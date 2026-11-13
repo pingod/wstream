@@ -13,6 +13,20 @@
 - **多实例自动分配**：未显式指定 `WSTREAM_ROOT`/`WSTREAM_PORT` 时，重复 `wstream start`
   会自动新建实例（`/tmp/wstream-2`、`-3`… + 顺延端口），不再只复用默认实例；显式指定
   root/port 仍保持幂等复用。lifecycle 增多实例回归（第 6 节）。
+- **输出尺寸自适应**：浏览器视口变化（<32px 去抖）→ 通过 `zwlr_output_manager` 动态重设
+  沙箱分辨率，快照与 `/info` 同源。
+- **H.264 视频流 `?video=h264`**：x264(zerolatency) 编码 + WS `0x82` 二进制帧 + 前端
+  WebCodecs `VideoDecoder`；MJPEG 仍是默认。ffprobe 校验流有效。
+- **keysym 直传（IME 改进）**：浏览器把非 ASCII 可打印字符（é/ñ/ü…）的码点直传，
+  服务端走 Unicode 注入，不受键盘布局影响。wstest 增第 5b 项回归。
+
+### 未做 / 限制
+
+- **input-method-v2**：本机 wayland-protocols 只装了 v1，v2 的 XML 取不到（gitlab 各标签 /
+  GitHub 镜像均 404），无法生成代码。现有中文路径（原生 Wayland keymap 换表 + XWayland
+  剪贴板）已可用。
+- **音频**：无头沙箱内没有音频守护进程（PipeWire 只在宿主）；要支持需在沙箱内起
+  PipeWire+null sink，输出基本静音，CI 无 pipewire 也无法测。暂不做。
 
 ## [0.2] - 2026-11-13
 
