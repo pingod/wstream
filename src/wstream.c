@@ -156,6 +156,7 @@ struct h264_enc {
     x264_nal_t *nals;
     int nals_n;
     int w, h, opened;
+    int bad_w, bad_h;   /* 上次失败的尺寸：同尺寸不再重试，避免每帧刷屏 */
 };
 static unsigned g_h264_seq;
 
@@ -1316,7 +1317,11 @@ static const char INDEX_HTML[] =
     "function conn(){\n"
     "  ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');\n"
     "  ws.binaryType='arraybuffer';\n"
-    "  ws.onopen=()=>{st.textContent='画面 + 输入已连接';st.style.color='#4ade80';setTimeout(fitViewport,200);if(startVideo())send(10,1,0);};\n"
+    "  ws.onopen=()=>{st.textContent='画面 + 输入已连接';st.style.color='#4ade80';setTimeout(fitViewport,200);\n"
+    "    if(startVideo()){send(10,1,0);\n"
+    "      /* H.264 无帧（编码器打不开 / 尺寸非法等）就回退 MJPEG，别让用户看黑屏 */\n"
+    "      setTimeout(()=>{if(!gotVid){vdec=null;cv.style.display='none';v.style.display='block';send(10,0,0);}},2500);\n"
+    "    }};\n"
     "  ws.onmessage=ev=>{\n"
     "    const b=new Uint8Array(ev.data);\n"
     "    if(b.length<8)return;\n"
@@ -1364,7 +1369,7 @@ static const char INDEX_HTML[] =
     "}\n"
     "window.addEventListener('resize',()=>{clearTimeout(_rszT);_rszT=setTimeout(fitViewport,500);});\n"
     "/* ---------- H.264 视频（WebCodecs），失败回退 MJPEG img ---------- */\n"
-    "let vdec=null;const cv=document.getElementById('cv');\n"
+    "let vdec=null,gotVid=false;const cv=document.getElementById('cv');\n"
     "function startVideo(){\n"
     "  if(!('VideoDecoder' in window)||!cv)return false;\n"
     "  try{\n"
@@ -1388,6 +1393,7 @@ static const char INDEX_HTML[] =
     "}\n"
     "function feedVideo(d){\n"
     "  if(!vdec||vdec.state!=='configured')return;\n"
+    "  gotVid=true;\n"
     "  try{ vdec.decode(new EncodedVideoChunk({type:_isKey(d)?'key':'delta',timestamp:performance.now()*1000,data:d})); }catch(e){}\n"
     "}\n"
     "/* type 5：8 字节头 + UTF-8 负载。中文/emoji 等非 ASCII 走这条。\n"
@@ -2402,10 +2408,12 @@ static void handle_msg(unsigned long caller_id, const uint8_t *m, size_t n) {
         return;
     }
     if (type == 9) {
-        /* 动态输出尺寸（viewport 驱动）：任何客户端都可请求，改的是共享视图 */
-        g_resize_w = (int)((m[4]) | (m[5] << 8));
-        g_resize_h = (int)((m[6]) | (m[7] << 8));
-        g_resize_dirty = 1;
+        /* 动态输出尺寸（viewport 驱动）：任何客户端都可请求，改的是共享视图。
+         * x264 要求宽高为偶数 → 向下取偶；否则 H.264 编码器打不开，前端 canvas
+         * 一直黑（MJPEG 的 <img> 已被隐藏）。 */
+        int w = (int)((m[4]) | (m[5] << 8)) & ~1;
+        int h = (int)((m[6]) | (m[7] << 8)) & ~1;
+        if (w >= 2 && h >= 2) { g_resize_w = w; g_resize_h = h; g_resize_dirty = 1; }
         return;
     }
     if (type == 10) {
@@ -3026,8 +3034,14 @@ static int stream_main(int argc, char **argv) {
                 }
             }
             if (vsubs) {
-                /* H.264（WebCodecs 订阅者）；尺寸变了重开编码器 */
-                if (!h264.opened || h264.w != W || h264.h != H) h264_open(&h264, W, H);
+                /* H.264（WebCodecs 订阅者）；尺寸变了重开编码器。
+                 * 同尺寸失败过就不再重试，否则奇数宽高等会每帧刷一条错误。 */
+                if (!h264.opened || h264.w != W || h264.h != H) {
+                    if (h264.bad_w != W || h264.bad_h != H) {
+                        if (h264_open(&h264, W, H) < 0) { h264.bad_w = W; h264.bad_h = H; }
+                        else { h264.bad_w = 0; h264.bad_h = 0; }
+                    }
+                }
                 if (h264.opened && h264_encode(&h264, fb[cur].addr) > 0) push_h264(&h264);
             }
         }
