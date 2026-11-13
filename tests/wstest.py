@@ -956,12 +956,15 @@ def main():
             os.unlink(ppm)
         r = subprocess.run([os.path.join(REPO, "wstream"), "-s", ppm],
                            env=env, capture_output=True, text=True, timeout=30)
-        head2 = ""
+        head2 = b""
+        fsize = 0
         if os.path.exists(ppm):
-            with open(ppm) as f:
-                head2 = f.readline().strip() + " " + f.readline().strip()
-        check("-s 快照模式无需端口即可抓帧", r.returncode == 0 and head2 == "P6 1280 720",
-              f"(rc={r.returncode} head={head2!r} err={r.stderr[-150:]})")
+            fsize = os.path.getsize(ppm)
+            with open(ppm, "rb") as f:
+                head2 = f.readline().strip() + b" " + f.readline().strip()
+        check("-s 快照模式无需端口即可抓帧",
+              r.returncode == 0 and head2 == b"P6 1280 720",
+              f"(rc={r.returncode} size={fsize} head={head2[:40]!r} err={r.stderr[-120:]})")
         st, _ = http_body("/")
         check("-s 之后主实例仍在服务", "200" in st, f"(st={st})")
 
