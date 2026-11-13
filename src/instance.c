@@ -445,7 +445,7 @@ static pid_t spawn_wstream(const char *root, int port, const char *wl) {
         if (sl < 0) _exit(127);
         self[sl] = 0;
         execl(self, "wstream", "stream", "-p", portstr,
-              "-f", "10", "-v", (char *)NULL);
+              "-f", "10", "--verbose", (char *)NULL);
         _exit(127);
     }
     return pid;
@@ -957,9 +957,9 @@ static void usage(void) {
         "  wstream list [--url] [-p PORT]   列出运行中的实例\n"
         "  wstream stop-all [--yes] [--dry-run]   停止所有实例\n"
         "  wstream dashboard [-o OUT]  生成所有实例的总览页面\n"
-        "  wstream stream [-p PORT] [-f FPS] [-q QUALITY] [-s FILE.ppm] [-v]\n"
+        "  wstream stream [-p PORT] [-f FPS] [-q QUALITY] [-s FILE.ppm] [--verbose]\n"
         "                             纯推流客户端（连接 WAYLAND_DISPLAY 指向的合成器）\n"
-        "  wstream version | help\n\n"
+        "  wstream version | help     版本与用法（-v / --version 同义）\n\n"
         "环境变量：WSTREAM_ROOT（沙箱根目录）、WSTREAM_PORT（端口）\n"
         "⚠️ 别裸跑 stream 连真实桌面：默认拒绝 /run/user/<uid>，用 start 起沙箱。\n",
         WSTREAM_VERSION);

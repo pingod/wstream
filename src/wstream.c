@@ -44,6 +44,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <getopt.h>
 
 #include <turbojpeg.h>
 #include <xkbcommon/xkbcommon.h>
@@ -2445,16 +2446,31 @@ static void on_sig(int s) { (void)s; g_run = 0; }
 static int stream_main(int argc, char **argv) {
     int port = 8765, fps = 10, opt;
     const char *ppm_out = NULL;
-    while ((opt = getopt(argc, argv, "p:f:q:vs:")) != -1) {
+    /* -v/--version 显示版本（用户约定）；详细日志改用 --verbose。 */
+    static const struct option longopts[] = {
+        {"verbose", no_argument, NULL, 1000},
+        {"version", no_argument, NULL, 'v'},
+        {"help",    no_argument, NULL, 'h'},
+        {NULL, 0, NULL, 0}
+    };
+    while ((opt = getopt_long(argc, argv, "p:f:q:s:vh", longopts, NULL)) != -1) {
         switch (opt) {
         case 'p': port = atoi(optarg); break;
         case 'f': fps = atoi(optarg); break;
         case 'q': g_quality = atoi(optarg); break;
-        case 'v': g_verbose = 1; break;
         case 's': ppm_out = optarg; break;
+        case 'v': printf("wstream %s\n", WSTREAM_VERSION); return 0;
+        case 1000: g_verbose = 1; break;   /* --verbose */
+        case 'h':
+            fprintf(stderr, "wstream %s\n", WSTREAM_VERSION);
+            fprintf(stderr, "用法: %s [-p 端口(默认8765)] [-f 帧率(默认10)] [-q JPEG质量(默认70)]\n"
+                        "          [-s 快照.ppm (抓一帧存盘就退出)] [--verbose]\n"
+                        "  -v/--version 显示版本；--verbose 详细日志\n", argv[0]);
+            return 0;
         default:
             fprintf(stderr, "用法: %s [-p 端口(默认8765)] [-f 帧率(默认10)] [-q JPEG质量(默认70)]\n"
-                        "          [-s 快照.ppm  (抓一帧存盘就退出，不需要浏览器)] [-v]\n", argv[0]);
+                        "          [-s 快照.ppm (抓一帧存盘就退出)] [--verbose]\n"
+                        "  -v/--version 显示版本；--verbose 详细日志\n", argv[0]);
             return 2;
         }
     }
@@ -2749,7 +2765,7 @@ int main(int argc, char **argv) {
             return instance_main(argc - 1, argv + 1);
         if (!strcmp(c, "stream"))
             return stream_main(argc - 1, argv + 1);
-        if (!strcmp(c, "--version") || !strcmp(c, "-V")) {
+        if (!strcmp(c, "--version") || !strcmp(c, "-V") || !strcmp(c, "-v")) {
             printf("wstream %s\n", WSTREAM_VERSION);
             return 0;
         }

@@ -2,6 +2,23 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.2] - 2026-11-13
+
+首个公开发版（重新起版本号；此前 1.x 为内部开发序列）。内容即 1.6.0 的完整状态：
+实例编排已内置为 `wstream` 子命令、脚本废弃。另按约定调整版本接口：
+
+### 变更
+
+- **`-v` 改为显示版本号**（符合直觉）；原「详细日志」改用 `--verbose`。`wstream start`
+  内部 spawn 同步改 `--verbose`，起停行为不变。
+- 版本单一来源 `src/instance.h` 的 `WSTREAM_VERSION`（现为 `0.2`）；`-v`/`--version`/`-V`/
+  `wstream version`/`GET /info` 同源。README 增「版本管理」节。
+
+### 验证
+
+- `./build.sh` 零警告；`tests/wstest.py` **41/41**、`tests/lifecycle.py` **15/15**。
+- `-v`/`--version`/`-V`/`version`/`/info` 均输出 `0.2`；start/stop 零残留。
+
 ## [1.6.0] - 2026-11-13
 
 把实例编排从 shell 脚本搬进二进制：`scripts/*.sh` 废弃删除，统一为 `wstream` 子命令。

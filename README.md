@@ -171,7 +171,20 @@ XDG_RUNTIME_DIR=/path/to/run WAYLAND_DISPLAY=wayland-1 ./wstream -p 8765 -f 10 -
 | `-f FPS` | 帧率，范围 1..30 | `10` |
 | `-q QUALITY` | JPEG 质量，范围 1..100 | `70` |
 | `-s FILE.ppm` | 抓一帧存 PPM 后退出（不占端口，可与运行中实例共存） | — |
-| `-v` | 详细日志（会把 keymap 落盘到 `/tmp/wstream-keymap.txt`） | off |
+| `--verbose` | 详细日志（会把 keymap 落盘到 `/tmp/wstream-keymap.txt`） | off |
+| `-v` / `--version` / `-V` | 显示版本号（与 `wstream version`、`GET /info` 同源） | — |
+
+### 版本管理
+
+版本号单一来源：`src/instance.h` 的 `WSTREAM_VERSION` 宏。`-v` / `--version` / `-V` /
+`wstream version` / `GET /info` 全部读它，改一处即全局生效。
+
+发版流程（仓库约定，见 AGENTS.md）：
+1. 改 `WSTREAM_VERSION` → 本地 `./build.sh` 零警告 + `tests/wstest.py`、`tests/lifecycle.py` 全绿。
+2. 提交并推送（带代理）。
+3. **等远程 CI 绿**——发版是唯一必须本地 + CI 双绿的时刻。
+4. `git tag vX.Y` 并推送 tag（带代理）。
+5. `gh release create vX.Y --notes …`（需可写缓存目录 `XDG_CACHE_HOME`）。
 
 ### 环境变量
 
@@ -724,7 +737,7 @@ WAYLAND_DEBUG=client ./wstream -p 8765 2>&1 | grep -E "motion|button|keymap|key"
 XDG_RUNTIME_DIR=/tmp/wstream/run WAYLAND_DISPLAY=wayland-1 grim -c /tmp/s.png
 
 # 4. 落盘 keymap 检查语法
-./wstream -v -s /tmp/x.ppm && cat /tmp/wstream-keymap.txt
+./wstream --verbose -s /tmp/x.ppm && cat /tmp/wstream-keymap.txt
 ```
 
 ### 协议代码生成
