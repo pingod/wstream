@@ -985,6 +985,25 @@ def main():
         except Exception as e:
             check("客户端库自动探测分辨率", False, f"(异常={e})")
             check("客户端库扩展头收帧+剪贴板往返", False, f"(异常={e})")
+
+        # 9k. 隔离护栏：裸 wstream 指向真实登录会话必须拒绝（绝不能抓真实桌面）。
+        #     两条都在 wl_display_connect 之前 die，不会真连桌面，安全。
+        real_rt = f"/run/user/{os.getuid()}"
+        wbin = os.path.join(REPO, "wstream")
+        guard_env = dict(os.environ, XDG_RUNTIME_DIR=real_rt, WAYLAND_DISPLAY="wayland-1")
+        guard_env.pop("WSTREAM_ALLOW_REAL_DISPLAY", None)
+        rg = subprocess.run([wbin, "-p", str(PORT)], env=guard_env,
+                            capture_output=True, text=True, timeout=10)
+        check("裸跑指向真实桌面被拒绝", rg.returncode != 0 and "拒绝连接真实桌面" in rg.stderr,
+              f"(rc={rg.returncode} err={rg.stderr[-120:]})")
+        # 显式开关解锁护栏；用不存在的 socket 名验证「不再被护栏拦」，随后连不上退出
+        # —— socket 名是假的，不会真连到真实桌面。
+        ov_env = dict(guard_env, WAYLAND_DISPLAY="wayland-nonexistent-999",
+                      WSTREAM_ALLOW_REAL_DISPLAY="1")
+        ro = subprocess.run([wbin, "-p", str(PORT)], env=ov_env,
+                            capture_output=True, text=True, timeout=10)
+        check("显式开关解锁护栏", "拒绝连接真实桌面" not in ro.stderr and "连不上 Wayland" in ro.stderr,
+              f"(rc={ro.returncode} err={ro.stderr[-120:]})")
     finally:
         try:
             probe.terminate()

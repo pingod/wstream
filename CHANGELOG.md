@@ -2,6 +2,23 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.5.1] - 2026-11-13
+
+修一个隔离脚枪：**裸 `./wstream` 会串流并注入你的真实桌面**。
+
+### 修复
+
+| 现象 | 原因 |
+|---|---|
+| 直接 `./wstream`（不经 start.sh）抓到真实显示器、键鼠打进真实桌面 | wstream 本身不启动合成器，只是 Wayland 客户端；裸跑继承真实会话环境（`XDG_RUNTIME_DIR=/run/user/<uid>`），`wl_display_connect(NULL)` 就连到了你自己的合成器 |
+
+**修法**：连接前检测是否指向真实登录会话（`XDG_RUNTIME_DIR == /run/user/<uid>`，或 `WAYLAND_DISPLAY` 是该目录下的绝对路径），是则**默认拒绝启动**并提示用 `./scripts/start.sh`。极少数确需直连真实桌面的场景，显式 `WSTREAM_ALLOW_REAL_DISPLAY=1` 解锁。start.sh 起的沙箱（`XDG_RUNTIME_DIR=$ROOT/run`）不受影响。
+
+### 验证
+
+- `./build.sh` 零警告
+- `tests/wstest.py` **41/41**（新增 2 项护栏断言：裸跑指向真实桌面被拒、显式开关解锁），`tests/lifecycle.py` **15/15**
+
 ## [1.5.0] - 2026-11-13
 
 一次系统性审计后的加固版本：修了一批「平时不暴露、特定输入 / 并发 / 慢客户端下才炸」

@@ -55,7 +55,7 @@
 #include "virtual-keyboard.h"
 #include "wlr-data-control.h"
 
-#define WSTREAM_VERSION "1.5.0"
+#define WSTREAM_VERSION "1.5.1"
 
 /* ============================================================ 基础工具 */
 
@@ -2478,6 +2478,28 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_sig);
     signal(SIGPIPE, SIG_IGN);
 
+
+    /* ⚠️ 隔离红线（HANDOFF 坑 35）：wstream 自己**不启动**任何合成器，它只是个
+     * Wayland 客户端，连的是环境里 WAYLAND_DISPLAY/XDG_RUNTIME_DIR 指向的合成器。
+     * 直接 ./wstream 会继承真实登录会话的环境（/run/user/<uid>），于是抓屏抓的是
+     * 你的真实显示器、键鼠注入也打进真实桌面 —— 正是本项目要杜绝的。默认拒绝连接
+     * 真实会话；隔离沙箱请用 ./scripts/start.sh。极少数确需直连真实桌面的场景，
+     * 显式 WSTREAM_ALLOW_REAL_DISPLAY=1 解锁。 */
+    {
+        const char *rt0 = getenv("XDG_RUNTIME_DIR");
+        const char *wl0 = getenv("WAYLAND_DISPLAY");
+        char real_rt[64], real_prefix[72];
+        snprintf(real_rt, sizeof real_rt, "/run/user/%u", (unsigned)getuid());
+        snprintf(real_prefix, sizeof real_prefix, "%s/", real_rt);
+        int is_real = (rt0 && !strcmp(rt0, real_rt)) ||
+                      (wl0 && wl0[0] == '/' && !strncmp(wl0, real_prefix, strlen(real_prefix)));
+        if (is_real && !getenv("WSTREAM_ALLOW_REAL_DISPLAY")) {
+            die("拒绝连接真实桌面会话（XDG_RUNTIME_DIR=%s, WAYLAND_DISPLAY=%s）。\n"
+                "  wstream 不会自己启动 sway；直接运行会抓屏并注入到你的真实桌面。\n"
+                "  隔离沙箱请用 ./scripts/start.sh；确需直连真实桌面设 WSTREAM_ALLOW_REAL_DISPLAY=1。",
+                rt0 ? rt0 : "(未设)", wl0 ? wl0 : "(未设)");
+        }
+    }
     /* ---------- 连接 Wayland ---------- */
     memset(&cap, 0, sizeof cap);
     cap.display = wl_display_connect(NULL);

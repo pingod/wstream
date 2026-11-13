@@ -159,6 +159,10 @@ sudo pacman -S --needed gcc pkgconf wayland wayland-protocols \
 XDG_RUNTIME_DIR=/path/to/run WAYLAND_DISPLAY=wayland-1 ./wstream -p 8765 -f 10 -q 70
 ```
 
+> ⚠️ **别直接裸跑 `./wstream`**：它不启动合成器，会连到你环境里的真实桌面并抓屏/注入。
+> 1.5.1 起默认拒绝连接真实登录会话（`/run/user/<uid>`）；上面这种指向**其它沙箱**的用法不受影响。
+> 确需直连真实桌面：`WSTREAM_ALLOW_REAL_DISPLAY=1`（自负其责）。
+
 ### 命令行参数
 
 | 参数 | 说明 | 默认 |
