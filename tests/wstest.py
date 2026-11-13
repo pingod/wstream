@@ -61,7 +61,9 @@ def http_req(headers, path="/ws", timeout=5):
     return line
 
 
-def ws_connect(origin="http://127.0.0.1:8765"):
+def ws_connect(origin=None):
+    if origin is None:
+        origin = f"http://{HOST}:{PORT}"
     s = socket.create_connection((HOST, PORT), timeout=8)
     req = (f"GET /ws HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nUpgrade: websocket\r\n"
            "Connection: Upgrade\r\nSec-WebSocket-Key: "
