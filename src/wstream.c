@@ -47,6 +47,7 @@
 #include <getopt.h>
 
 #include <turbojpeg.h>
+#include <x264.h>
 #include <xkbcommon/xkbcommon.h>
 
 #include <wayland-client.h>
@@ -146,6 +147,87 @@ static unsigned long jpeg_encode(struct jpeg_enc *e, const uint8_t *bgrx, int w,
         }
     }
     return 0;
+}
+
+/* ============================================================ H.264（x264，参考 waymote） */
+struct h264_enc {
+    x264_t *enc;
+    x264_picture_t pic_in, pic_out;
+    x264_nal_t *nals;
+    int nals_n;
+    int w, h, opened;
+};
+static unsigned g_h264_seq;
+
+static int h264_open(struct h264_enc *e, int w, int h) {
+    if (e->opened) {
+        x264_encoder_close(e->enc);
+        x264_picture_clean(&e->pic_in);
+        e->opened = 0;
+    }
+    x264_param_t p;
+    if (x264_param_default_preset(&p, "ultrafast", "zerolatency") < 0) { logf_("h264: preset 失败"); return -1; }
+    p.i_width = w; p.i_height = h;
+    p.i_fps_num = g_fps > 0 ? g_fps : 10; p.i_fps_den = 1;
+    p.i_csp = X264_CSP_I420;
+    p.b_annexb = 1;
+    p.i_threads = 1;
+    p.i_keyint_max = (g_fps > 0 ? g_fps : 10) * 2;
+    if (x264_param_apply_profile(&p, "baseline") < 0) { logf_("h264: apply_profile(baseline) 失败"); return -1; }
+    e->enc = x264_encoder_open(&p);
+    if (!e->enc) { logf_("h264: x264_encoder_open 失败（csp=%d %dx%d）", p.i_csp, w, h); return -1; }
+    x264_picture_init(&e->pic_in);
+    if (x264_picture_alloc(&e->pic_in, X264_CSP_I420, w, h) < 0) {
+        logf_("h264: picture_alloc 失败");
+        x264_encoder_close(e->enc);
+        return -1;
+    }
+    e->w = w; e->h = h; e->nals = NULL; e->nals_n = 0; e->opened = 1;
+    return 0;
+}
+
+/* BGRX（合成器的 XRGB8888 内存序）→ I420（BT.601）。给 x264 baseline 用。 */
+static void bgrx_to_i420(const uint8_t *bgrx, int w, int h,
+                         uint8_t *Y, int ys, uint8_t *U, int us, uint8_t *V, int vs) {
+    for (int j = 0; j < h; j++) {
+        const uint8_t *row = bgrx + (size_t)j * w * 4;
+        uint8_t *yr = Y + (size_t)j * ys;
+        for (int i = 0; i < w; i++) {
+            int B = row[i*4+0], G = row[i*4+1], R = row[i*4+2];
+            int yy = (77*R + 150*G + 29*B) >> 8;
+            yr[i] = (uint8_t)(yy < 0 ? 0 : yy > 255 ? 255 : yy);
+        }
+    }
+    for (int j = 0; j < h/2; j++) {
+        uint8_t *ur = U + (size_t)j * us;
+        uint8_t *vr = V + (size_t)j * vs;
+        for (int i = 0; i < w/2; i++) {
+            int sumR = 0, sumG = 0, sumB = 0;
+            for (int dy = 0; dy < 2; dy++) {
+                const uint8_t *row = bgrx + (size_t)(j*2+dy) * w * 4;
+                for (int dx = 0; dx < 2; dx++) {
+                    const uint8_t *px = row + (size_t)(i*2+dx) * 4;
+                    sumB += px[0]; sumG += px[1]; sumR += px[2];
+                }
+            }
+            int R = sumR >> 2, G = sumG >> 2, B = sumB >> 2;
+            int uu = (-43*R - 85*G + 128*B + 32768) >> 8;
+            int vv = (128*R - 107*G - 21*B + 32768) >> 8;
+            ur[i] = (uint8_t)(uu < 0 ? 0 : uu > 255 ? 255 : uu);
+            vr[i] = (uint8_t)(vv < 0 ? 0 : vv > 255 ? 255 : vv);
+        }
+    }
+}
+
+static int h264_encode(struct h264_enc *e, const uint8_t *bgrx) {
+    if (!e->opened) return -1;
+    bgrx_to_i420(bgrx, e->w, e->h,
+                 e->pic_in.img.plane[0], e->pic_in.img.i_stride[0],
+                 e->pic_in.img.plane[1], e->pic_in.img.i_stride[1],
+                 e->pic_in.img.plane[2], e->pic_in.img.i_stride[2]);
+    e->nals_n = 0;
+    int r = x264_encoder_encode(e->enc, &e->nals, &e->nals_n, &e->pic_in, &e->pic_out);
+    return r >= 0 ? e->nals_n : -1;
 }
 
 /* ============================================================ Wayland 状态 */
@@ -1119,6 +1201,7 @@ struct client {
     int fd;                 /* -1 = 空槽 / 已死，等回收 */
     int is_stream;
     int is_ws;
+    int want_video;         /* 订阅 H.264（WS 下行 0x82） */
     unsigned long id;       /* 槽位会被复用，id 单调递增永不重用 */
     uint8_t in[16384];
     size_t in_len;
@@ -1220,7 +1303,7 @@ static const char INDEX_HTML[] =
     "background:#0009;color:#fff;font-size:14px;letter-spacing:.1em;cursor:pointer;"
     "text-transform:uppercase;backdrop-filter:blur(2px)}\n"
     "</style></head><body>\n"
-    "<div id=wrap><img id=v src=\"/stream.mjpg\"><div id=cur></div>"
+    "<div id=wrap><img id=v src=\"/stream.mjpg\"><canvas id=cv style=\"display:none;max-width:100%;max-height:100%;background:#000\"></canvas><div id=cur></div>"
     "<div id=hint>点击画面开始操作</div></div>\n"
     "<div id=bar>agent sandbox · <b id=st>连接中…</b> · 点画面接管（同一时刻只有一人能操作）· Ctrl+Esc 释放</div>\n"
     "<div id=clipbar>📋 <b id=st2>剪贴板未同步</b> · Ctrl+Shift+V 粘贴到我电脑</div>\n"
@@ -1233,10 +1316,11 @@ static const char INDEX_HTML[] =
     "function conn(){\n"
     "  ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');\n"
     "  ws.binaryType='arraybuffer';\n"
-    "  ws.onopen=()=>{st.textContent='画面 + 输入已连接';st.style.color='#4ade80';setTimeout(fitViewport,200);};\n"
+    "  ws.onopen=()=>{st.textContent='画面 + 输入已连接';st.style.color='#4ade80';setTimeout(fitViewport,200);if(startVideo())send(10,1,0);};\n"
     "  ws.onmessage=ev=>{\n"
     "    const b=new Uint8Array(ev.data);\n"
     "    if(b.length<8)return;\n"
+    "    if(b[0]===0x82){ feedVideo(b.subarray(8)); return; }   /* 0x82 = H.264 视频 */\n"
     "    if(b[0]===0x81){            /* 0x81 = 下行剪贴板内容 */\n"
     "      const txt=new TextDecoder().decode(b.subarray(8));\n"
     "      sandboxClip=txt;\n"
@@ -1271,6 +1355,33 @@ static const char INDEX_HTML[] =
     "  _lastW=w;_lastH=h; send(9,w,h);\n"
     "}\n"
     "window.addEventListener('resize',()=>{clearTimeout(_rszT);_rszT=setTimeout(fitViewport,500);});\n"
+    "/* ---------- H.264 视频（WebCodecs），失败回退 MJPEG img ---------- */\n"
+    "let vdec=null;const cv=document.getElementById('cv');\n"
+    "function startVideo(){\n"
+    "  if(!('VideoDecoder' in window)||!cv)return false;\n"
+    "  try{\n"
+    "    vdec=new VideoDecoder({\n"
+    "      output:fr=>{ if(cv.width!==fr.displayWidth||cv.height!==fr.displayHeight){cv.width=fr.displayWidth;cv.height=fr.displayHeight;} cv.getContext('2d').drawImage(fr,0,0); fr.close(); },\n"
+    "      error:e=>{ console.warn('video decode error',e); vdec=null; cv.style.display='none'; v.style.display='block'; },\n"
+    "    });\n"
+    "    vdec.configure({codec:'avc1.42E01E'});\n"
+    "    v.style.display='none'; cv.style.display='block';\n"
+    "    return true;\n"
+    "  }catch(e){ console.warn('VideoDecoder init failed',e); vdec=null; return false; }\n"
+    "}\n"
+    "function _isKey(d){\n"
+    "  for(let i=0;i+4<d.length;i++){\n"
+    "    if(d[i]===0&&d[i+1]===0&&(d[i+2]===1||(d[i+2]===0&&d[i+3]===1))){\n"
+    "      let t=(d[i+2]===1)?d[i+3]:d[i+4];\n"
+    "      if((t&0x1f)===5||(t&0x1f)===7)return true;\n"
+    "    }\n"
+    "  }\n"
+    "  return false;\n"
+    "}\n"
+    "function feedVideo(d){\n"
+    "  if(!vdec||vdec.state!=='configured')return;\n"
+    "  try{ vdec.decode(new EncodedVideoChunk({type:_isKey(d)?'key':'delta',timestamp:performance.now()*1000,data:d})); }catch(e){}\n"
+    "}\n"
     "/* type 5：8 字节头 + UTF-8 负载。中文/emoji 等非 ASCII 走这条。\n"
     " * 服务端收到后换 keymap 注入，见 inject_text()。 */\n"
     "function sendText(t){\n"
@@ -1506,6 +1617,34 @@ static void push_clipboard(unsigned long req_id) {
     free(msg);
 }
 
+/* 推一帧 H.264（Annex-B）给订阅了视频的 WS 客户端。调用方不持锁。 */
+static void push_h264(struct h264_enc *e) {
+    if (e->nals_n <= 0) return;
+    size_t total = 0;
+    for (int i = 0; i < e->nals_n; i++) total += (size_t)e->nals[i].i_payload;
+    if (!total) return;
+    size_t n = 8 + total;
+    uint8_t *msg = malloc(n);
+    if (!msg) return;
+    memset(msg, 0, 8);
+    msg[0] = 0x82;   /* 0x80 = 服务端→客户端, 2 = H.264 视频 */
+    unsigned seq = ++g_h264_seq;
+    msg[4] = (uint8_t)(seq & 0xFF); msg[5] = (uint8_t)((seq >> 8) & 0xFF);
+    msg[6] = (uint8_t)((seq >> 16) & 0xFF); msg[7] = (uint8_t)((seq >> 24) & 0xFF);
+    size_t off = 8;
+    for (int i = 0; i < e->nals_n; i++) {
+        memcpy(msg + off, e->nals[i].p_payload, (size_t)e->nals[i].i_payload);
+        off += (size_t)e->nals[i].i_payload;
+    }
+    pthread_mutex_lock(&g_cl_mu);
+    for (int ci = 0; ci < nclients; ci++) {
+        struct client *c = &clients[ci];
+        if (c->is_ws && c->want_video) ws_send_frame_locked(c, 2, msg, n);
+    }
+    pthread_mutex_unlock(&g_cl_mu);
+    free(msg);
+}
+
 /* 有没有人在看画面。主线程用它决定这一帧要不要编码 —— 必须走锁，
  * 否则读到的是网络线程正在改的 nclients（数据竞争，UB）。
  * ⚠️ 只数流客户端：纯 WS 连接（agent 脚本）不看画面，不算观众，
@@ -1640,6 +1779,15 @@ static int has_viewers(void) {
     int n = 0;
     for (int i = 0; i < nclients; i++)
         if (clients[i].is_stream) n++;
+    pthread_mutex_unlock(&g_cl_mu);
+    return n > 0;
+}
+
+static int has_video_subs(void) {
+    pthread_mutex_lock(&g_cl_mu);
+    int n = 0;
+    for (int i = 0; i < nclients; i++)
+        if (clients[i].is_ws && clients[i].want_video) n++;
     pthread_mutex_unlock(&g_cl_mu);
     return n > 0;
 }
@@ -2249,6 +2397,12 @@ static void handle_msg(unsigned long caller_id, const uint8_t *m, size_t n) {
         g_resize_dirty = 1;
         return;
     }
+    if (type == 10) {
+        /* 订阅 H.264 视频（WS 下行 0x82）；m[4]!=0 开、0 关。调用方已持 g_cl_mu。 */
+        int idx = client_by_id(caller_id);
+        if (idx >= 0) clients[idx].want_video = m[4] != 0;
+        return;
+    }
 
     /* ---------- 输入帧：必须持有输入权 ---------- */
     /* ⚠️ 在前端隐藏按钮是不够的：任何脚本都能直接连 /ws 发帧。
@@ -2706,6 +2860,7 @@ static int stream_main(int argc, char **argv) {
 
     struct jpeg_enc enc;
     if (jpeg_open(&enc) < 0) die("初始化 JPEG 编码器失败");
+    struct h264_enc h264 = {0};   /* 惰性初始化：有视频订阅者时才开 */
 
     const long period_ns = 1000000000L / fps;
     struct timespec next;
@@ -2830,6 +2985,7 @@ static int stream_main(int argc, char **argv) {
             pthread_mutex_lock(&g_snap_mu);
             int need_snap = g_snap_want;
             pthread_mutex_unlock(&g_snap_mu);
+            int vsubs = has_video_subs();
             if (has_viewers() || need_snap) {
                 /* 有人看流、或有人在等快照，都要编码 */
                 unsigned long jlen = jpeg_encode(&enc, fb[cur].addr, W, H);
@@ -2841,6 +2997,11 @@ static int stream_main(int argc, char **argv) {
                     /* 编码失败也要唤醒，否则 HTTP 线程白等 3 秒 */
                     snap_publish(NULL, 0);
                 }
+            }
+            if (vsubs) {
+                /* H.264（WebCodecs 订阅者）；尺寸变了重开编码器 */
+                if (!h264.opened || h264.w != W || h264.h != H) h264_open(&h264, W, H);
+                if (h264.opened && h264_encode(&h264, fb[cur].addr) > 0) push_h264(&h264);
             }
         }
         /* -s：抓一帧存 PPM 就退出 */

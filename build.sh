@@ -29,6 +29,6 @@ gen protocols/virtual-keyboard-unstable-v1.xml   virtual-keyboard
 gcc -O2 -g -Wall -Wextra -o wstream src/wstream.c src/instance.c \
     proto/wlr-screencopy.c proto/wlr-virtual-pointer.c proto/virtual-keyboard.c \
     proto/wlr-data-control.c proto/wlr-output-management.c \
-    -Iproto $(pkg-config --cflags --libs wayland-client libturbojpeg xkbcommon) -lpthread
+    -Iproto $(pkg-config --cflags --libs wayland-client libturbojpeg xkbcommon) -lx264 -lpthread
 
 echo "✅ 编译完成：$(pwd)/wstream"
