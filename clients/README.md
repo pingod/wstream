@@ -50,6 +50,7 @@ with WStream() as ws:
 | `windows()` | `[{app_id, title, x, y, width, height, cx, cy}]` |
 | `window(app_id=, title_contains=)` | 找一个窗口 |
 | `move(x,y)` / `click(x,y)` / `click_window()` | 鼠标（像素坐标） |
+| `output_size()` | 沙箱分辨率 `(w,h)`；默认自动从 `/info` 探测 |
 | `scroll(steps)` | 滚轮，正数向上 |
 | `tap(ch)` / `type_text(s)` | 逐键输入 ASCII |
 | `type_any(s)` | 任意文本：ASCII 走逐键，含中文自动走剪贴板 |
@@ -59,6 +60,10 @@ with WStream() as ws:
 | `set_clipboard()` / `get_clipboard()` | 沙箱剪贴板 |
 | `snapshot(path=None)` | 取实时截图（JPEG） |
 | `run_in_window(cmd, app_id=)` | 点窗口 + 输入命令 + 回车 |
+
+> **分辨率自动探测**：`WStream()` 默认不写死分辨率，首次 `move/click` 时从
+> `GET /info` 探测沙箱真实尺寸（`start.sh` 默认 1600x1000，别猜）。也可显式传
+> `WStream(width=1280, height=720)` 跳过探测。
 
 ## 三个容易踩的坑
 
@@ -84,4 +89,5 @@ with WStream() as ws:
 | `GET /stream.mjpg` | MJPEG 流（浏览器 `<img>` 用） |
 | `GET /snapshot.jpg` | 单帧 JPEG（agent 截图用，带 800ms 缓存） |
 | `GET /windows` | 窗口列表 + 精确坐标（读 sway IPC） |
+| `GET /info` | 沙箱元信息（version/width/height/fps/quality），客户端自动探测分辨率用 |
 | `WS /ws` | 输入注入 + 剪贴板 |

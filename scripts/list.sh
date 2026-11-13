@@ -12,11 +12,14 @@ set -u
 
 PORT_ARG=""
 URL_ONLY=0
-for a in "$@"; do
-  case "$a" in
+# ⚠️ 用 while+shift，不能 for a in "$@" 里 shift：for 遍历的是原始列表，
+#    shift 改的是位置参数，`--url -p 8801` 会把 PORT_ARG 读成 "-p"。
+while [ $# -gt 0 ]; do
+  case "$1" in
     --url) URL_ONLY=1 ;;
     -p|--port) shift; PORT_ARG="${1:-}" ;;
   esac
+  shift
 done
 
 say() { printf '%b\n' "$*"; }
@@ -35,7 +38,8 @@ for p in $(pgrep -x wstream 2>/dev/null); do
   root=$(dirname "$rt")
   # 端口在命令行里：-p 8801
   port=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | sed -n 's/.*-p \([0-9]\+\).*/\1/p')
-  [ -n "${port:-}" ] || continue
+  # 手动启动（不带 -p）的 wstream 用默认端口 8765，别漏掉
+  [ -n "${port:-}" ] || port=8765
   [ -n "$PORT_ARG" ] && [ "$port" != "$PORT_ARG" ] && continue
 
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$port/" 2>/dev/null || echo "---")

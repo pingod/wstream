@@ -85,6 +85,9 @@ with WStream() as ws:
     ws.snapshot("/tmp/now.jpg")           # 取一张截图看图
 ```
 
+> 分辨率自动探测：`WStream()` 默认从 `GET /info` 探测沙箱真实尺寸再换算坐标，
+> 不用手填 width/height（start.sh 默认 1600x1000）。`ws.output_size()` 可查。
+
 API 速查见 `clients/README.md`。下面两种方式是它的底层实现，
 需要精细控制时再看。
 
@@ -311,9 +314,9 @@ WL=$(cat $ROOT/wl_name)
 # 抓一张图（-c 会把鼠标光标也画进去）
 XDG_RUNTIME_DIR=$ROOT/run WAYLAND_DISPLAY=$WL grim -c /tmp/shot.png
 
-# 用 wstream 自己的快照模式（不需要另装 grim）
+# 用 wstream 自己的快照模式（不需要另装 grim；不占端口，可与运行中实例共存）
 XDG_RUNTIME_DIR=$ROOT/run WAYLAND_DISPLAY=$WL \
-  ./wstream -p 8899 -s /tmp/shot.ppm
+  ./wstream -s /tmp/shot.ppm
 ffmpeg -i /tmp/shot.ppm /tmp/shot.png
 ```
 
@@ -371,7 +374,7 @@ hyprctl cursorpos
 |---|---|
 | **XWayland 程序注不进去** | firefox / Electron 默认走 X11，wstream 只能操作原生 Wayland 客户端。要让它们走 Wayland：加 `MOZ_ENABLE_WAYLAND=1`（firefox）或 `--ozone-platform=wayland`（Electron/Chromium） |
 | 只能本机访问 | 只监听 `127.0.0.1`；已校验 `Host`/`Origin`，但无 token、无 TLS |
-| 有 `/snapshot.jpg` 和 `/windows` | 前者取单帧、后者查窗口坐标，不用装 grim |
+| 有 `/snapshot.jpg`、`/windows`、`/info` | 单帧截图、窗口坐标、沙箱元信息（尺寸/版本），不用装 grim |
 | Xwayland 里的中文 | 逐键到不了，但**走剪贴板可以**（type 7 + Ctrl+V） |
 | 无音频 | 只传画面 |
 | 无剪贴板同步 | 沙箱与宿主机剪贴板不通 |

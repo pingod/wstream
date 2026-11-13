@@ -59,11 +59,11 @@ class WStream:
 
     参数：
       host/port   wstream 监听地址（默认 127.0.0.1:8765）
-      width/height 沙箱分辨率，用于坐标换算；不确定就用默认值，
-                  move_px() 会自动从 /windows 推断
+      width/height 沙箱分辨率，用于坐标换算。默认 None = 首次 move/click
+                  时自动从 GET /info 探测（start.sh 默认 1600x1000，别猜）
     """
 
-    def __init__(self, host="127.0.0.1", port=8765, width=1280, height=720,
+    def __init__(self, host="127.0.0.1", port=8765, width=None, height=None,
                  timeout=8.0):
         self.host = host
         self.port = port
@@ -140,26 +140,28 @@ class WStream:
             while True:
                 # 先看缓冲区里有没有完整帧
                 if len(self._recvbuf) >= 2:
-                    b0, b1 = self._recvbuf[0], self._recvbuf[1]
+                    b1 = self._recvbuf[1]
                     n = b1 & 0x7F
                     off = 2
+                    hdr_ok = True
                     if n == 126:
                         if len(self._recvbuf) < 4:
-                            pass
+                            hdr_ok = False   # 扩展长度头还没收全
                         else:
                             n = struct.unpack(">H", self._recvbuf[2:4])[0]
                             off = 4
                     elif n == 127:
                         if len(self._recvbuf) < 10:
-                            pass
+                            hdr_ok = False
                         else:
                             n = struct.unpack(">Q", self._recvbuf[2:10])[0]
                             off = 10
-                    if off == 2 or len(self._recvbuf) >= off:
-                        if len(self._recvbuf) >= off + n:
-                            payload = self._recvbuf[off:off + n]
-                            self._recvbuf = self._recvbuf[off + n:]
-                            return payload
+                    # ⚠️ 必须等扩展长度头收全再判断载荷长度。原来头不全时 off 留在 2、
+                    #    n 留在 126/127，会被当成「2 字节头 + 126 字节载荷」误解析。
+                    if hdr_ok and len(self._recvbuf) >= off + n:
+                        payload = self._recvbuf[off:off + n]
+                        self._recvbuf = self._recvbuf[off + n:]
+                        return payload
                 chunk = self._sock.recv(65536)
                 if not chunk:
                     return None
@@ -204,6 +206,24 @@ class WStream:
                 return w
         return None
 
+    def output_size(self):
+        """沙箱输出分辨率 (width, height)。显式传过 width/height 就用它，
+        否则从 GET /info 探测一次并缓存。"""
+        self._ensure_size()
+        return self.width, self.height
+
+    def _ensure_size(self):
+        if self.width is not None and self.height is not None:
+            return
+        try:
+            info = json.loads(self._http("/info", timeout=5).decode("utf-8"))
+            self.width = int(info["width"])
+            self.height = int(info["height"])
+        except Exception as e:
+            raise WStreamError(
+                f"无法探测沙箱分辨率（/info 不可用：{e}）；"
+                "请显式传 width/height，或升级 wstream 到 1.5.0+")
+
     # ---------------------------------------------------------------- 控制
 
     def take(self):
@@ -219,6 +239,7 @@ class WStream:
 
     def move(self, x, y):
         """按像素坐标移动（用当前 width/height 换算成归一化值）。"""
+        self._ensure_size()
         nx = int(max(0, min(1, x / max(1, self.width))) * 65535)
         ny = int(max(0, min(1, y / max(1, self.height))) * 65535)
         self._cmd(T_MOVE, nx, ny)

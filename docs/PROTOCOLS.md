@@ -146,23 +146,26 @@ WAYLAND_DEBUG=client ./wstream -p 8765 2>&1 | grep -E "motion|button"
 
 如果看到 `motion_absolute(...)` 正常发送但光标不动 → 合成器不支持。
 
-**当前实现**：用相对位移累积模拟绝对定位（兼容性最好）：
+**当前实现**：直接用 `motion_absolute`（sway 完整支持）。早期用「相对位移累积」，
+但依赖「光标初始在 (0,0)」的错误假设 —— 合成器重启后光标不在原点，每次点击都偏移
+且越积越偏（见 HANDOFF 坑 9）。absolute 不依赖任何当前位置假设：
 
 ```c
-static int g_cur_x, g_cur_y;   /* 我们以为光标在哪 */
-
-static void inject_move(int vx, int vy, int W, int H) {
-    int tx = (int)((long long)vx * W / 65535);
-    int ty = (int)((long long)vy * H / 65535);
-    int dx = tx - g_cur_x, dy = ty - g_cur_y;
-    if (dx == 0 && dy == 0) return;
-    zwlr_virtual_pointer_v1_motion(cap.ptr, now_ms(),
-        wl_fixed_from_int(dx), wl_fixed_from_int(dy));
+static void inject_move(int vx, int vy, int eW, int eH) {
+    if (!cap.ptr || eW <= 0 || eH <= 0) return;
+    /* 归一化 0..65535 → 像素，并夹到 [0, extent-1] */
+    int tx = (int)((long long)vx * eW / 65535);
+    int ty = (int)((long long)vy * eH / 65535);
+    if (tx >= eW) tx = eW - 1;
+    if (ty >= eH) ty = eH - 1;
+    zwlr_virtual_pointer_v1_motion_absolute(cap.ptr, now_ms(),
+        (uint32_t)tx, (uint32_t)ty, (uint32_t)eW, (uint32_t)eH);
     zwlr_virtual_pointer_v1_frame(cap.ptr);
     wl_display_flush(cap.display);
-    g_cur_x = tx; g_cur_y = ty;
 }
 ```
+
+> labwc 不支持 `motion_absolute`（静默丢弃），真要在 labwc 上跑需降级回相对位移。
 
 ### 坐标范围（⚠️ 这里是像素，不是归一化值）
 

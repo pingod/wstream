@@ -28,6 +28,7 @@ import time
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("WSTREAM_PORT", "8765"))
 ROOT = os.environ.get("WSTREAM_ROOT", "/tmp/wstream")
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 FAILS = []
 PASSES = []
@@ -461,6 +462,66 @@ def ws_recv_frame(s, timeout=5):
         return None
 
 
+def http_body(path, headers=None, timeout=5):
+    """GET 一个端点，返回 (状态行, body bytes)。Connection: close 读到 EOF。"""
+    s = socket.create_connection((HOST, PORT), timeout=timeout)
+    h = {"Host": f"{HOST}:{PORT}"}
+    if headers:
+        h.update(headers)
+    req = f"GET {path} HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in h.items()) + "\r\n"
+    s.sendall(req.encode())
+    data = b""
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    head, _, body = data.partition(b"\r\n\r\n")
+    return head.split(b"\r\n")[0].decode(errors="replace"), body
+
+
+def ws_recv_raw(s, timeout=5):
+    """收一帧，返回 (opcode, payload)。超时/断开返回 (None, b"")。"""
+    s.settimeout(timeout)
+    try:
+        hdr = s.recv(2)
+        if len(hdr) < 2:
+            return None, b""
+        opcode = hdr[0] & 0x0F
+        n = hdr[1] & 0x7F
+        if n == 126:
+            n = struct.unpack(">H", s.recv(2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", s.recv(8))[0]
+        buf = b""
+        while len(buf) < n:
+            chunk = s.recv(n - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return opcode, buf
+    except (socket.timeout, OSError):
+        return None, b""
+
+
+def ws_send_raw(s, opcode, payload, masked=True):
+    """发一个任意 opcode 的帧（测试 ping / 未掩码 / 超尺寸用）。"""
+    n = len(payload)
+    flag = 0x80 if masked else 0
+    if n < 126:
+        hdr = bytes([0x80 | opcode, flag | n])
+    elif n < 65536:
+        hdr = bytes([0x80 | opcode, flag | 126]) + struct.pack(">H", n)
+    else:
+        hdr = bytes([0x80 | opcode, flag | 127]) + struct.pack(">Q", n)
+    if masked:
+        m = os.urandom(4)
+        s.sendall(hdr + m + bytes(c ^ m[i % 4] for i, c in enumerate(payload)))
+    else:
+        s.sendall(hdr + payload)
+
+
 def probe_output(log):
     try:
         with open(log) as f:
@@ -818,6 +879,112 @@ def main():
             cbproc.terminate()
         except Exception:
             pass
+
+        print("── 9. 协议与端点健壮性（1.5.0 新增）──")
+        import json
+        # 9a. /info 元信息端点
+        st, body = http_body("/info")
+        info = {}
+        try:
+            info = json.loads(body.decode("utf-8"))
+        except Exception:
+            pass
+        check("/info 返回正确分辨率", "200" in st and info.get("width") == W
+              and info.get("height") == H, f"(st={st} info={info})")
+        check("/info 带版本号", bool(info.get("version")), f"(info={info})")
+
+        # 9b. 端点精确匹配：/notwindows 不该命中 /windows（原来 strstr 会误命中）
+        st, body = http_body("/notwindows")
+        check("/notwindows 不误命中 /windows", "200" in st and b"windows" not in body,
+              f"(st={st})")
+        st, body = http_body("/windows")
+        check("/windows 正常返回窗口列表", "200" in st and b"windows" in body, f"(st={st})")
+        st, _ = http_body("/wsfoo")
+        check("/wsfoo 不误升级为 WebSocket", "101" not in st, f"(st={st})")
+
+        # 9c. ping → pong
+        sp = ws_connect()
+        ws_send_raw(sp, 0x9, b"hello")
+        op, pl = ws_recv_raw(sp, timeout=5)
+        check("ping 收到 pong", op == 0xA and pl == b"hello", f"(op={op} pl={pl!r})")
+        sp.close()
+
+        # 9d. 未掩码帧必须被断开（RFC 6455）
+        su = ws_connect()
+        ws_send_raw(su, 0x2, bytes([6, 0, 0, 0]) + struct.pack("<HH", 1, 0), masked=False)
+        op, _ = ws_recv_raw(su, timeout=5)
+        check("未掩码帧被断开", op is None, f"(op={op})")
+        su.close()
+
+        # 9e. 超尺寸帧（>16KB 缓冲）必须被断开，而不是静默清空空转
+        so = ws_connect()
+        ws_send_raw(so, 0x2, b"\x00" * 20000)
+        op, _ = ws_recv_raw(so, timeout=5)
+        check("超尺寸帧被断开", op is None, f"(op={op})")
+        so.close()
+
+        # 9f. 并发剪贴板请求：两个客户端同时 type 8，都要收到响应
+        sa, sb = ws_connect(), ws_connect()
+        time.sleep(0.2)
+        ws_send(sa, 8)
+        ws_send(sb, 8)
+        ga = ws_recv_frame(sa, timeout=6)
+        gb = ws_recv_frame(sb, timeout=6)
+        ok_a = bool(ga and len(ga) >= 8 and ga[0] == 0x81)
+        ok_b = bool(gb and len(gb) >= 8 and gb[0] == 0x81)
+        check("并发剪贴板请求都有响应", ok_a and ok_b, f"(a={ok_a} b={ok_b})")
+        sa.close()
+        sb.close()
+
+        # 9g. -s 快照模式不占端口：与运行中的实例共存，不用 -p 绕
+        ppm = "/tmp/wstream_snap_test.ppm"
+        if os.path.exists(ppm):
+            os.unlink(ppm)
+        r = subprocess.run([os.path.join(REPO, "wstream"), "-s", ppm],
+                           env=env, capture_output=True, text=True, timeout=30)
+        head2 = ""
+        if os.path.exists(ppm):
+            with open(ppm) as f:
+                head2 = f.readline().strip() + " " + f.readline().strip()
+        check("-s 快照模式无需端口即可抓帧", r.returncode == 0 and head2 == "P6 1280 720",
+              f"(rc={r.returncode} head={head2!r} err={r.stderr[-150:]})")
+        st, _ = http_body("/")
+        check("-s 之后主实例仍在服务", "200" in st, f"(st={st})")
+
+        # 9h. 参数校验：越界的 -q / -p 启动即报错（不需要 Wayland）
+        rq = subprocess.run([os.path.join(REPO, "wstream"), "-q", "0"],
+                            capture_output=True, text=True, timeout=10)
+        check("越界 -q 被拒绝", rq.returncode == 2 and "质量" in rq.stderr,
+              f"(rc={rq.returncode} err={rq.stderr[-100:]})")
+        rp = subprocess.run([os.path.join(REPO, "wstream"), "-p", "0"],
+                            capture_output=True, text=True, timeout=10)
+        check("越界 -p 被拒绝", rp.returncode == 2 and "端口" in rp.stderr,
+              f"(rc={rp.returncode} err={rp.stderr[-100:]})")
+
+        # 9i. list.sh 参数解析：--url -p PORT 必须能过滤出本实例
+        rl = subprocess.run([os.path.join(REPO, "scripts", "list.sh"),
+                             "--url", "-p", str(PORT)],
+                            capture_output=True, text=True, timeout=15)
+        check("list.sh --url -p 正确过滤", f"http://127.0.0.1:{PORT}" in rl.stdout,
+              f"(out={rl.stdout!r})")
+
+        # 9j. 客户端库：自动探测分辨率 + 扩展长度头收帧
+        sys.path.insert(0, os.path.join(REPO, "clients"))
+        try:
+            import wstream_client
+            with wstream_client.WStream(port=PORT) as ws:
+                ws.wait_ready()
+                size = ws.output_size()
+                check("客户端库自动探测分辨率", size == (W, H), f"(size={size})")
+                big = "客户端库自检" * 30   # >125 字节，响应走扩展长度头
+                ws.set_clipboard(big)
+                time.sleep(1.0)
+                got = ws.get_clipboard(timeout=6)
+                check("客户端库扩展头收帧+剪贴板往返", bool(got and "客户端库自检" in got),
+                      f"(got={got!r})")
+        except Exception as e:
+            check("客户端库自动探测分辨率", False, f"(异常={e})")
+            check("客户端库扩展头收帧+剪贴板往返", False, f"(异常={e})")
     finally:
         try:
             probe.terminate()

@@ -133,6 +133,15 @@ if [ "${1:-}" = "stop" ]; then stop_all; exit 0; fi
 
 [ -x "$REPO/wstream" ] || die "先编译：$REPO/build.sh"
 
+# 参数校验：SIZE 必须是 WxH，PORT 必须是 1..65535。
+# ⚠️ 原来不校验：`start.sh abc` 会让 wlr-randr --custom-mode abc 静默失败，
+#    分辨率悄悄回退到默认；PORT 非数字会让 wstream -p 拿到 0。宁可早报错。
+_w="${SIZE%x*}"; _h="${SIZE#*x}"
+case "$_w" in ''|*[!0-9]*) die "分辨率格式应为 WxH（如 1600x1000），收到：$SIZE" ;; esac
+case "$_h" in ''|*[!0-9]*) die "分辨率格式应为 WxH（如 1600x1000），收到：$SIZE" ;; esac
+case "$PORT" in ''|*[!0-9]*) die "端口必须是数字（1..65535），收到：$PORT" ;; esac
+[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "端口越界（1..65535）：$PORT"
+
 # ---------- 1. 无头沙箱 ----------
 WL=""
 # ⚠️ 判据是「socket 真的能连上」，不是「socket 文件存在」。
@@ -214,10 +223,18 @@ XEOF
   fi
   echo "$WL" > "$ROOT/wl_name"
 
-  # 改分辨率
-  OUT=$(XDG_RUNTIME_DIR="$ROOT/run" WAYLAND_DISPLAY="$WL" wlr-randr 2>/dev/null | head -1 | awk '{print $1}')
-  [ -n "${OUT:-}" ] && XDG_RUNTIME_DIR="$ROOT/run" WAYLAND_DISPLAY="$WL" \
-      wlr-randr --output "$OUT" --custom-mode "$SIZE" >/dev/null 2>&1
+  # 改分辨率。wlr-randr 缺失或失败时必须明确警告 —— 原来静默忽略，
+  # 用户以为设了 1920x1080 实际还是默认 1280x720，坐标全对不上。
+  if ! command -v wlr-randr >/dev/null 2>&1; then
+    log "⚠️ 没装 wlr-randr，分辨率保持合成器默认（请求的 $SIZE 未生效）"
+  else
+    OUT=$(XDG_RUNTIME_DIR="$ROOT/run" WAYLAND_DISPLAY="$WL" wlr-randr 2>/dev/null | head -1 | awk '{print $1}')
+    if [ -n "${OUT:-}" ]; then
+      XDG_RUNTIME_DIR="$ROOT/run" WAYLAND_DISPLAY="$WL" \
+        wlr-randr --output "$OUT" --custom-mode "$SIZE" >/dev/null 2>&1 \
+        || log "⚠️ wlr-randr 设置 $SIZE 失败，分辨率可能未生效"
+    fi
+  fi
   sleep 3
 fi
 

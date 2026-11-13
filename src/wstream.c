@@ -55,6 +55,8 @@
 #include "virtual-keyboard.h"
 #include "wlr-data-control.h"
 
+#define WSTREAM_VERSION "1.5.0"
+
 /* ============================================================ 基础工具 */
 
 static int g_verbose;
@@ -77,6 +79,7 @@ static int g_keymap_fresh;
 static uint32_t g_mods_sent;
 
 static int g_port = 8765;   /* 用于 Origin 校验：只信任发往本端口的页面 */
+static int g_width, g_height;   /* 输出尺寸（/info 用，启动后只读） */
 static volatile sig_atomic_t g_net_stop;   /* main 退出时通知网络线程收工 */
 
 static void logf_(const char *fmt, ...) {
@@ -274,21 +277,30 @@ static char g_keymap_text[8192];
 static int  g_keymap_len;
 
 static void input_init(struct capture *c) {
-    if (!c->ptr_mgr || !c->kbd_mgr || !c->seat) {
+    if ((!c->ptr_mgr && !c->kbd_mgr) || !c->seat) {
         logf_("⚠️ 合成器缺虚拟输入协议（ptr=%p kbd=%p seat=%p）→ 只读模式",
               (void *)c->ptr_mgr, (void *)c->kbd_mgr, (void *)c->seat);
         return;
     }
-    c->kbd = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(c->kbd_mgr, c->seat);
-    if (!c->kbd) { logf_("⚠️ 创建虚拟键盘失败"); return; }
+    if (c->kbd_mgr) {
+        c->kbd = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(c->kbd_mgr, c->seat);
+        if (!c->kbd) logf_("⚠️ 创建虚拟键盘失败 → 键盘不可用");
+    }
 
     /* ⚠️ 这里必须真的创建虚拟指针，否则 cap.ptr 一直是 NULL，
      * inject_move() / inject_button() 第一行 `if (!cap.ptr) return;`
      * 就把所有鼠标事件静默丢掉了 —— 表现为「画面能看、键盘能打、
      * 但鼠标点了没反应」，而日志却还骗人地说「虚拟指针已就绪」。
      * seat 为 NULL 时传 NULL，协议允许（合成器自己选默认 seat）。 */
-    c->ptr = zwlr_virtual_pointer_manager_v1_create_virtual_pointer(c->ptr_mgr, c->seat);
-    if (!c->ptr) logf_("⚠️ 创建虚拟指针失败 → 只能键盘操作，鼠标不可用");
+    if (c->ptr_mgr) {
+        c->ptr = zwlr_virtual_pointer_manager_v1_create_virtual_pointer(c->ptr_mgr, c->seat);
+        if (!c->ptr) logf_("⚠️ 创建虚拟指针失败 → 只能键盘操作，鼠标不可用");
+    }
+    /* 键盘创建失败不能连累鼠标：两者独立，能用一个是一个。 */
+    if (!c->kbd) {
+        if (c->ptr) logf_("✅ 虚拟指针已就绪（键盘不可用）");
+        return;
+    }
 
     static char km[8192];
     /* 用完整的 evdev 布局：手搓的「每个 keycode 只有一个 keysym」表虽然能过
@@ -326,17 +338,6 @@ static void input_init(struct capture *c) {
     logf_("✅ 虚拟键盘%s已就绪（可交互）", c->ptr ? " + 虚拟指针" : "（鼠标不可用）");
 }
 
-/* 虚拟指针的绝对定位。
- *
- * ⚠️ 为什么用「相对位移累积」而不是 motion_absolute：
- *   zwlr_virtual_pointer_v1 虽然有 motion_absolute 请求，但 wlroots 只把它
- *   转成事件抛给合成器，**要不要实现取决于合成器**。labwc 只接了
- *   wlr_seat_pointer_notify_motion（相对位移），没有实现 absolute —— 所以
- *   motion_absolute 发出去会被静默丢弃：日志显示请求正常发送、合成器也收到了，
- *   但光标纹丝不动，点击因此全部落在初始位置。这是「键盘能用、鼠标点不动」的根因。
- *   实测（WAYLAND_DEBUG）确认请求格式无误，所以只能改用 motion(dx,dy) 累积定位。
- *
- * 坐标约定：vx/vy 是 0..65535 的归一化值，W/H 是输出尺寸。 */
 /* 光标定位。
  *
  * ⚠️ 这里从「相对位移累积」改成了 motion_absolute，原因是一个实测出来的 bug：
@@ -421,17 +422,15 @@ static volatile int g_input_dirty;   /* 有输入事件待 roundtrip（只在主
 
 
 
-/* 与 wtype 相同的做法：为「单个 evdev keycode」生成一张只含它的 keymap 并通过
- * memfd 传给合成器，紧贴在 key 事件之前。返回时 memfd 已关闭（合成器已 mmap）。 */
 /* 推送「完整的 evdev 布局」keymap。要点全是踩出来的：
  *   1) 不能只列单个键位（wtype 那样）：合成器按这张表重编 xkb，其余键位会变成
  *      NoSymbol，打一个键之后整个键盘就没反应了；
- *   2) 多个虚拟键盘并存时，生效的是"最后一次推送"的那张表；所以每一键都推一次，
- *      盖掉别人（wtype/wshowkeys）留下的残缺表；
+ *   2) 多个虚拟键盘并存时，生效的是"最后一次推送"的那张表；
  *   3) 顺序必须 keymap → key：合成器一收到 keymap 就标记可用，随后的 key 才被处理。
+ * ⚠️ 只在 keymap 失效时推（初次 / Unicode 注入之后），不要每键都推 ——
+ *    推 keymap 会清零修饰位，组合键全坏（见 g_keymap_fresh 的说明）。
  * 传 memfd 后立即 close，合成器已 mmap。 */
-int push_keymap_snapshot(struct capture *cap, uint32_t evdev_code) {
-    (void)evdev_code;
+static int push_keymap_snapshot(struct capture *cap) {
     if (!cap->kbd) return -1;
     static const char KM[] =
         "xkb_keymap {\n"
@@ -476,7 +475,7 @@ static void inject_key(uint32_t code, uint32_t down) {
      * ⚠️ 不要每键都推：推 keymap 会清零修饰位，组合键直接失效。
      * 详见 g_keymap_fresh 的说明。 */
     if (!g_keymap_fresh) {
-        push_keymap_snapshot(&cap, code);
+        push_keymap_snapshot(&cap);
         g_keymap_fresh = 1;
         g_mods_sent = 0;   /* 新 keymap 会让合成器清掉修饰位，我们也要同步 */
     }
@@ -587,23 +586,35 @@ static char   g_clip_out[CLIP_MAX];
 static size_t g_clip_out_len;
 static struct zwlr_data_control_source_v1 *g_clip_source;   /* 当前持有者 */
 
-/* 正在 receive 的 fd：读完后把数据塞进 g_clip_text */
+/* 正在 receive 的 fd：读完后把数据塞进 g_clip_text。
+ * ⚠️ 两个教训：
+ *   1) 不能边读边写 g_clip_text —— HTTP 线程随时在 clipboard_get 里读它，
+ *      不加锁就是数据竞争。先读进本地 staging，再一次性持锁拷入。
+ *   2) 读管道必须有超时：沙箱里跑的是不可信程序，它 hold 住管道不写，
+ *      裸 read() 会把主循环（抓帧）永久卡死。 */
 static void clip_read_fd(int fd) {
-    char buf[8192];
+    static char stage[CLIP_MAX];   /* 只在主线程调用，static 安全 */
     size_t total = 0;
+    uint32_t deadline = now_ms() + 2000;
     for (;;) {
+        int32_t left = (int32_t)(deadline - now_ms());
+        if (left <= 0) break;
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+        if (poll(&p, 1, left) <= 0) break;
+        char buf[8192];
         ssize_t n = read(fd, buf, sizeof buf);
         if (n <= 0) break;
         if (total + (size_t)n >= CLIP_MAX) {   /* 超限截断 */
             size_t room = CLIP_MAX - 1 - total;
-            if (room > 0) { memcpy(g_clip_text + total, buf, room); total += room; }
+            if (room > 0) { memcpy(stage + total, buf, room); total += room; }
             break;
         }
-        memcpy(g_clip_text + total, buf, (size_t)n);
+        memcpy(stage + total, buf, (size_t)n);
         total += (size_t)n;
     }
     close(fd);
     pthread_mutex_lock(&g_clip_mu);
+    memcpy(g_clip_text, stage, total);
     g_clip_text[total] = 0;
     g_clip_len = total;
     g_clip_ver++;
@@ -723,7 +734,12 @@ static void src_send(void *data, struct zwlr_data_control_source_v1 *src,
     if (!strncmp(mime, "text/", 5) || !strcmp(mime, "UTF8_STRING") ||
         !strcmp(mime, "STRING") || !strcmp(mime, "TEXT")) {
         size_t off = 0;
+        uint32_t deadline = now_ms() + 2000;   /* 取方卡住也不能拖死主循环 */
         while (off < g_clip_out_len) {
+            int32_t left = (int32_t)(deadline - now_ms());
+            if (left <= 0) break;
+            struct pollfd p = { .fd = fd, .events = POLLOUT };
+            if (poll(&p, 1, left) <= 0) break;
             ssize_t n = write(fd, g_clip_out + off, g_clip_out_len - off);
             if (n <= 0) break;
             off += (size_t)n;
@@ -866,6 +882,10 @@ static uint32_t utf8_next(const uint8_t **pp, const uint8_t *end) {
         if ((p[i] & 0xC0) != 0x80) { *pp = p + 1; return 0xFFFD; }
         cp = (cp << 6) | (p[i] & 0x3F);
     }
+    /* 拒绝 overlong 编码（如 C0 80 假装 NUL）和超出 Unicode 范围的码点：
+     * 它们不是合法 UTF-8，放过去会把控制字符/怪键打进沙箱。 */
+    static const uint32_t min_cp[4] = { 0, 0x80, 0x800, 0x10000 };
+    if (cp < min_cp[extra] || cp > 0x10FFFF) { *pp = p + 1; return 0xFFFD; }
     *pp = p + extra + 1;
     return cp;
 }
@@ -903,7 +923,7 @@ static int inject_text(const char *s, size_t n) {
     }
     /* ⚠️ 关键收尾：把完整 evdev keymap 推回去，否则后续普通按键全失效 */
     if (count > 0) {
-        push_keymap_snapshot(&cap, 0);
+        push_keymap_snapshot(&cap);
         g_keymap_fresh = 1;
         g_mods_sent = 0;
         wl_display_roundtrip(cap.display);
@@ -917,6 +937,7 @@ static int save_ppm(const uint8_t *bgrx, int w, int h, const char *path) {
     if (!f) return -1;
     fprintf(f, "P6\n%d %d\n255\n", w, h);
     uint8_t *row = malloc((size_t)w * 3);
+    if (!row) { fclose(f); return -1; }
     for (int y = 0; y < h; y++) {
         const uint8_t *s2 = bgrx + (size_t)y * w * 4;
         for (int x = 0; x < w; x++) {
@@ -1134,7 +1155,7 @@ static const char INDEX_HTML[] =
     "}\n"
     "conn();\n"
     "/* 8 字节帧，布局必须与服务端 handle_msg 逐字节一致：\n"
-    " *   [0]=type  [1]=保留  [2..3]=保留  [4..5]=A(int16 LE)  [6..7]=B(int16 LE)\n"
+    " *   [0]=type  [1]=保留  [2..3]=保留  [4..5]=A(uint16 LE)  [6..7]=B(uint16 LE)\n"
     " * ⚠️ 这里曾经写成 type|flag|rsv|A|B（type 后跟两个 1 字节字段），服务端却按\n"
     " * 4 字节头读 A，于是 A 读到的永远是 0；而且整个帧只有 5 字节，直接触发\n"
     " * handle_msg 里 `if (n < 8) return` 被静默丢弃 —— 表现为「点得动、打不了字」。\n"
@@ -1143,7 +1164,7 @@ static const char INDEX_HTML[] =
     "  if(!ws||ws.readyState!==1)return;\n"
     "  const bf=new ArrayBuffer(8),dv=new DataView(bf);\n"
     "  dv.setUint8(0,type);dv.setUint8(1,0);dv.setUint16(2,0,true);\n"
-    "  dv.setInt16(4,a|0,true);dv.setInt16(6,b|0,true);\n"
+    "  dv.setUint16(4,a&0xffff,true);dv.setUint16(6,b&0xffff,true);\n"
     "  ws.send(bf);\n"
     "}\n"
     "/* type 5：8 字节头 + UTF-8 负载。中文/emoji 等非 ASCII 走这条。\n"
@@ -1382,7 +1403,9 @@ static void push_clipboard(unsigned long req_id) {
 }
 
 /* 有没有人在看画面。主线程用它决定这一帧要不要编码 —— 必须走锁，
- * 否则读到的是网络线程正在改的 nclients（数据竞争，UB）。 */
+ * 否则读到的是网络线程正在改的 nclients（数据竞争，UB）。
+ * ⚠️ 只数流客户端：纯 WS 连接（agent 脚本）不看画面，不算观众，
+ *    否则没人开浏览器时也 10fps 编码，白耗 CPU。 */
 /* ---------- 按需快照（GET /snapshot.jpg） ----------
  *
  * 场景：agent 想知道「现在屏幕长什么样」，只想拿一张图。
@@ -1418,17 +1441,19 @@ static void snap_publish(const uint8_t *jpg, size_t len) {
     if (!g_snap_want) return;
     pthread_mutex_lock(&g_snap_mu);
     if (g_snap_want) {
-        if (len > g_snap_cap) {
+        if (jpg && len > g_snap_cap) {
             uint8_t *nb = realloc(g_snap_buf, len);
             if (nb) { g_snap_buf = nb; g_snap_cap = len; }
         }
-        if (len <= g_snap_cap) {
+        if (jpg && len > 0 && len <= g_snap_cap) {
             memcpy(g_snap_buf, jpg, len);
             g_snap_len = len;
-            g_snap_gen++;
-            g_snap_want = 0;
-            pthread_cond_broadcast(&g_snap_cv);
+        } else {
+            g_snap_len = 0;   /* 编码失败：也要唤醒等待者，让它们拿 503 */
         }
+        g_snap_gen++;
+        g_snap_want = 0;
+        pthread_cond_broadcast(&g_snap_cv);
     }
     pthread_mutex_unlock(&g_snap_mu);
 }
@@ -1508,7 +1533,9 @@ static int snap_wait(uint8_t **out, size_t *out_len) {
 
 static int has_viewers(void) {
     pthread_mutex_lock(&g_cl_mu);
-    int n = nclients;
+    int n = 0;
+    for (int i = 0; i < nclients; i++)
+        if (clients[i].is_stream) n++;
     pthread_mutex_unlock(&g_cl_mu);
     return n > 0;
 }
@@ -1531,32 +1558,9 @@ static int has_viewers(void) {
  * 这个端点返回 501，不影响其它功能。 */
 #define SWAY_IPC_GET_TREE 4
 
-/* 在 dir 里找 sway-ipc.*.sock。找不到返回 0。 */
-static int find_sway_sock(char *out, size_t cap, const char *dir) {
-    DIR *d = opendir(dir);
-    if (!d) return 0;
-    struct dirent *de;
-    int found = 0;
-    while ((de = readdir(d))) {
-        if (!strncmp(de->d_name, "sway-ipc.", 9)) {
-            snprintf(out, cap, "%s/%s", dir, de->d_name);
-            found = 1;
-            break;
-        }
-    }
-    closedir(d);
-    return found;
-}
-
-/* 通过 sway IPC 拿窗口树 JSON。成功返回 malloc 的字符串（调用方 free），失败 NULL。 */
-static char *sway_get_tree(void) {
-    const char *rt = getenv("XDG_RUNTIME_DIR");
-    char path[512];
-    if (!rt || !find_sway_sock(path, sizeof path, rt)) {
-        /* 退化：试 wstream 的默认根目录 */
-        if (!find_sway_sock(path, sizeof path, "/tmp/wstream/run")) return NULL;
-    }
-
+/* 对单个 sway-ipc socket 真正 connect + GET_TREE。成功返回 malloc 的 JSON。
+ * ⚠️ 必须带超时：sway 卡住时不能把 HTTP 线程永久挂起。 */
+static char *sway_try_sock(const char *path) {
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return NULL;
     struct sockaddr_un sa;
@@ -1567,6 +1571,9 @@ static char *sway_get_tree(void) {
     size_t plen_path = strlen(path);
     if (plen_path >= sizeof sa.sun_path) { close(fd); return NULL; }
     memcpy(sa.sun_path, path, plen_path + 1);
+    struct timeval tv = {2, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) { close(fd); return NULL; }
 
     const char *cmd = "GET_TREE";
@@ -1600,6 +1607,32 @@ static char *sway_get_tree(void) {
     buf[plen] = 0;
     close(fd);
     return buf;
+}
+
+/* 通过 sway IPC 拿窗口树 JSON。成功返回 malloc 的字符串（调用方 free），失败 NULL。
+ * ⚠️ 逐个尝试候选 socket，不能只取第一个 direntry：sway 重启会留下旧 socket
+ *    文件，readdir 顺序不保证，命中死 socket 就永远读不到窗口树。 */
+static char *sway_get_tree(void) {
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    const char *dirs[2];
+    int nd = 0;
+    if (rt) dirs[nd++] = rt;
+    dirs[nd++] = "/tmp/wstream/run";   /* 退化：wstream 的默认根目录 */
+    for (int di = 0; di < nd; di++) {
+        DIR *d = opendir(dirs[di]);
+        if (!d) continue;
+        struct dirent *de;
+        char path[512];
+        char *tree = NULL;
+        while (!tree && (de = readdir(d))) {
+            if (strncmp(de->d_name, "sway-ipc.", 9)) continue;
+            snprintf(path, sizeof path, "%s/%s", dirs[di], de->d_name);
+            tree = sway_try_sock(path);
+        }
+        closedir(d);
+        if (tree) return tree;
+    }
+    return NULL;
 }
 
 /* ---------- 极简 JSON 扫描器 ----------
@@ -1813,8 +1846,10 @@ static void sway_extract_windows(const char *json, char *out, size_t cap) {
     }
 
     size_t o = 0;
-    o += (size_t)snprintf(out + o, cap - o, "{\"windows\":[");
-    for (int i = 0; i < sc.out_n && o + 400 < cap; i++) {
+    int k = snprintf(out + o, cap - o, "{\"windows\":[");
+    if (k < 0 || (size_t)k >= cap) { out[0] = 0; return; }
+    o = (size_t)k;
+    for (int i = 0; i < sc.out_n; i++) {
         /* 转义 title */
         char esc[512];
         size_t eo = 0;
@@ -1823,12 +1858,20 @@ static void sway_extract_windows(const char *json, char *out, size_t cap) {
             if ((unsigned char)*q >= 0x20) esc[eo++] = *q;
         }
         esc[eo] = 0;
-        o += (size_t)snprintf(out + o, cap - o,
+        /* ⚠️ 先写进临时缓冲、确认放得下再拷入 out。
+         * 原来直接 o += snprintf 的返回值：snprintf 返回「想写的长度」，
+         * 截断时可能 > 剩余空间，o 越过 cap 后 cap - o 下溢成天文数字，
+         * 后续写入直接越界。单条窗口最长约 780B，临时缓冲给足 1024。 */
+        char entry[1024];
+        k = snprintf(entry, sizeof entry,
             "%s{\"app_id\":\"%s\",\"title\":\"%s\",\"x\":%d,\"y\":%d,"
             "\"width\":%d,\"height\":%d,\"cx\":%d,\"cy\":%d}",
             i ? "," : "", wins[i].app_id, esc,
             wins[i].x, wins[i].y, wins[i].w, wins[i].h,
             wins[i].x + wins[i].w / 2, wins[i].y + wins[i].h / 2);
+        if (k < 0 || o + (size_t)k + 3 > cap) break;   /* 留 "]}" 和 NUL */
+        memcpy(out + o, entry, (size_t)k);
+        o += (size_t)k;
     }
     snprintf(out + o, cap - o, "]}");
 }
@@ -1882,23 +1925,33 @@ static int origin_trusted(const char *origin, int port) {
     for (size_t i = 0; i < sizeof hosts / sizeof hosts[0]; i++) {
         snprintf(want, sizeof want, "%s:%d", hosts[i], port);
         if (!strcasecmp(origin, want)) return 1;
-        if (!strcasecmp(origin, hosts[i])) return 1;   /* 省略默认端口的情况 */
+        /* Origin 不带端口 = 默认端口 80。只有我们自己就在 80 时才可信；
+         * 否则那是本机另一个网站（比如本地 80 端口的服务），不能放行。 */
+        if (port == 80 && !strcasecmp(origin, hosts[i])) return 1;
     }
     return 0;
 }
 
 /* ---------- WebSocket 服务端 ---------- */
 
+/* 取请求行里的路径（去掉 ?query）。只认 GET。返回 0 成功。
+ * ⚠️ 端点匹配不能用 strstr(req, "/windows")：/notwindows、/a/windows/b
+ *    都会误命中。必须解析请求行、精确比对路径。 */
+static int req_path(const char *req, char *out, size_t cap) {
+    if (strncmp(req, "GET ", 4)) return -1;
+    const char *p = req + 4;
+    const char *e = p;
+    while (*e && *e != ' ' && *e != '\r' && *e != '\n' && *e != '?') e++;
+    size_t n = (size_t)(e - p);
+    if (n == 0 || n >= cap) return -1;
+    memcpy(out, p, n);
+    out[n] = 0;
+    return 0;
+}
+
 static int ws_wants(const char *req) {
-    const char *u = strstr(req, "GET ");
-    if (!u) return 0;
-    const char *e = strstr(u, "\r\n");
-    if (!e) return 0;
-    /* 路径必须以 /ws 结尾（允许 ?query） */
-    const char *p = u + 4;
-    if (p + 3 > e) return 0;
-    if (p[0] != '/' || p[1] != 'w' || p[2] != 's') return 0;
-    return 1;
+    char path[256];
+    return req_path(req, path, sizeof path) == 0 && !strcmp(path, "/ws");
 }
 
 /* 从请求头里抠 Sec-WebSocket-Key（去掉前导空格） */
@@ -1996,7 +2049,13 @@ static struct {
 } g_cq;
 static pthread_mutex_t g_cq_mu = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_clip_dirty;    /* 主线程要处理剪贴板请求 */
-static volatile int g_clip_req;      /* 哪个客户端要读剪贴板（0 = 无） */
+/* 等待剪贴板响应的客户端队列。
+ * ⚠️ 原来只存一个 id（还是 int，会截断 unsigned long）：两个客户端同时发
+ *    type 8，先来的那个永远收不到响应。用小环形队列，主线程一次回应所有人。 */
+#define CLIP_REQ_SLOTS 8
+static unsigned long g_clip_reqs[CLIP_REQ_SLOTS];
+static int g_clip_req_n;
+static pthread_mutex_t g_clip_req_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static int clip_enqueue(const char *s, size_t n) {
     if (n >= CLIP_MAX) return -1;
@@ -2072,7 +2131,10 @@ static void handle_msg(unsigned long caller_id, const uint8_t *m, size_t n) {
         return;
     }
     if (type == 8) {
-        g_clip_req = (int)caller_id;
+        pthread_mutex_lock(&g_clip_req_mu);
+        if (g_clip_req_n < CLIP_REQ_SLOTS)
+            g_clip_reqs[g_clip_req_n++] = caller_id;
+        pthread_mutex_unlock(&g_clip_req_mu);
         g_clip_dirty = 1;
         return;
     }
@@ -2117,7 +2179,8 @@ static void handle_msg(unsigned long caller_id, const uint8_t *m, size_t n) {
     }
 }
 
-/* 解析客户端缓冲里的 WS 帧。返回消耗的字节数；数据不全返回 0 */
+/* 解析客户端缓冲里的 WS 帧。返回消耗的字节数；数据不全返回 0；
+ * (size_t)-1 = 协议错误（断开），(size_t)-2 = 对端发了 close。 */
 static size_t ws_parse_one(struct client *cl) {
     uint8_t *p = cl->in;
     size_t avail = cl->in_len;
@@ -2140,23 +2203,32 @@ static size_t ws_parse_one(struct client *cl) {
         off = 10;
     }
     if (plen > 1024 * 1024) return (size_t)-1;    /* 异常，断开 */
-    uint8_t mask[4] = {0, 0, 0, 0};
-    if (masked) {
-        if (avail < off + 4) return 0;
-        memcpy(mask, p + off, 4);
-        off += 4;
-    }
+    /* RFC 6455：客户端帧必须加掩码，服务端收到未掩码帧必须断开。
+     * 我们的客户端（浏览器 / Python 库 / 测试）全都加掩码。 */
+    if (!masked) return (size_t)-1;
+    uint8_t mask[4];
+    if (avail < off + 4) return 0;
+    memcpy(mask, p + off, 4);
+    off += 4;
     if (avail < off + plen) return 0;
 
     uint8_t *payload = p + off;
-    if (masked) for (uint64_t i = 0; i < plen; i++) payload[i] ^= mask[i & 3];
+    for (uint64_t i = 0; i < plen; i++) payload[i] ^= mask[i & 3];
 
-    (void)fin;
+    /* 不支持分片消息：输入帧都很小，没有分片的必要。
+     * 原来 fin 被直接忽略，分片会被当成独立帧静默误解析 —— 宁可明确断开。 */
+    if (!fin || opcode == 0) return (size_t)-1;
+
     if (opcode == 2) {                                   /* 二进制：输入事件 */
         handle_msg(cl->id, payload, (size_t)plen);
-    } else if (opcode == 8) {                            /* close */
+    } else if (opcode == 8) {                            /* close：回应后断开 */
+        ws_send_frame_locked(cl, 8, payload, plen > 125 ? 0 : (size_t)plen);
         return (size_t)-2;
+    } else if (opcode == 9) {                            /* ping → pong */
+        if (plen > 125) return (size_t)-1;
+        ws_send_frame_locked(cl, 0xA, payload, (size_t)plen);
     }
+    /* opcode 1(text) / 10(pong)：忽略 */
     return off + (size_t)plen;
 }
 
@@ -2168,7 +2240,9 @@ static void ws_read(struct client *cl) {
         cl->is_ws = 0;   /* 标记掉线，外层回收 */
         return;
     }
-    if (cl->in_len + (size_t)rn > sizeof cl->in) { cl->in_len = 0; return; }
+    /* 缓冲装不下：单帧超过 16KB（输入帧远小于此）。不能静默清空缓冲 ——
+     * 那会丢掉已排队的有效帧，且连接永远卡在这里空转。直接断开。 */
+    if (cl->in_len + (size_t)rn > sizeof cl->in) { cl->is_ws = 0; cl->in_len = 0; return; }
     memcpy(cl->in + cl->in_len, tmp, (size_t)rn);
     cl->in_len += (size_t)rn;
 
@@ -2218,10 +2292,25 @@ static void *http_thread(void *arg) {
                 int fl = fcntl(cfd, F_GETFL);
                 fcntl(cfd, F_SETFL, fl & ~O_NONBLOCK);
 
+                /* 读完整请求头：循环 recv 直到 \r\n\r\n。
+                 * ⚠️ 单次 recv 不保证拿到完整头（TCP 分段），原来读一次就解析，
+                 *    头被切开时会误判路径/来源。总时限 3 秒，防慢速占用。 */
                 char req[2048];
-                ssize_t rn = recv(cfd, req, sizeof req - 1, 0);
-                if (rn <= 0) { close(cfd); continue; }
-                req[rn] = 0;
+                size_t rl = 0;
+                uint32_t deadline = now_ms() + 3000;
+                int hdr_ok = 0;
+                while (rl < sizeof req - 1) {
+                    int32_t left = (int32_t)(deadline - now_ms());
+                    if (left <= 0) break;
+                    struct pollfd rp = { .fd = cfd, .events = POLLIN };
+                    if (poll(&rp, 1, left) <= 0) break;
+                    ssize_t rn = recv(cfd, req + rl, sizeof req - 1 - rl, 0);
+                    if (rn <= 0) break;
+                    rl += (size_t)rn;
+                    req[rl] = 0;
+                    if (strstr(req, "\r\n\r\n")) { hdr_ok = 1; break; }
+                }
+                if (!hdr_ok) { close(cfd); continue; }
 
                 fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
 
@@ -2248,7 +2337,9 @@ static void *http_thread(void *arg) {
                         serve_forbidden(cfd);
                         continue;
                     }
-                    if (strstr(req, "/windows")) {
+                    char path[256];
+                    int have_path = req_path(req, path, sizeof path) == 0;
+                    if (have_path && !strcmp(path, "/windows")) {
                         /* 返回沙箱里的窗口列表 + 精确坐标，agent 据此决定点哪里 */
                         char *tree = sway_get_tree();
                         if (!tree) {
@@ -2280,7 +2371,7 @@ static void *http_thread(void *arg) {
                             free(tree);
                         }
                         close(cfd);
-                    } else if (strstr(req, "/snapshot.jpg")) {
+                    } else if (have_path && !strcmp(path, "/snapshot.jpg")) {
                         /* 取一张实时快照，不需要订阅流、不需要重启进程 */
                         uint8_t *jpg = NULL;
                         size_t jl = 0;
@@ -2303,7 +2394,23 @@ static void *http_thread(void *arg) {
                             if (send_all(cfd, h, (size_t)hn) == 0) send_all(cfd, b, sizeof b - 1);
                         }
                         close(cfd);
-                    } else if (strstr(req, "/stream.mjpg")) {
+                    } else if (have_path && !strcmp(path, "/info")) {
+                        /* 沙箱元信息：客户端据此自动换算坐标，不用猜分辨率 */
+                        char body[256];
+                        int bn = snprintf(body, sizeof body,
+                            "{\"version\":\"%s\",\"width\":%d,\"height\":%d,"
+                            "\"fps\":%d,\"quality\":%d}\n",
+                            WSTREAM_VERSION, g_width, g_height, g_fps, g_quality);
+                        char h[192];
+                        int hn = snprintf(h, sizeof h,
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: application/json; charset=utf-8\r\n"
+                            "Content-Length: %d\r\nCache-Control: no-store\r\n"
+                            "Connection: close\r\n\r\n", bn);
+                        if (send_all(cfd, h, (size_t)hn) == 0)
+                            send_all(cfd, body, (size_t)bn);
+                        close(cfd);
+                    } else if (have_path && !strcmp(path, "/stream.mjpg")) {
                         serve_stream(cfd);
                         pthread_mutex_lock(&g_cl_mu);
                         unsigned long id = client_add(cfd, 1, 0);
@@ -2352,6 +2459,16 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
+    /* 参数校验：越界的 quality 会让 tjCompress2 每帧都失败（表现为黑屏），
+     * 越界的 port 会让 htons 截断 / Origin 校验失效。宁可启动时就报错。 */
+    if (port < 1 || port > 65535) {
+        fprintf(stderr, "wstream: 端口越界（1..65535）：%d\n", port);
+        return 2;
+    }
+    if (g_quality < 1 || g_quality > 100) {
+        fprintf(stderr, "wstream: JPEG 质量越界（1..100）：%d\n", g_quality);
+        return 2;
+    }
     if (fps < 1) fps = 1;
     if (fps > 30) fps = 30;
     g_fps = fps;
@@ -2392,6 +2509,7 @@ int main(int argc, char **argv) {
         zwlr_screencopy_frame_v1_destroy(fr);
         if (cap.fb_w <= 0 || cap.fb_h <= 0) die("拿不到输出尺寸");
         W = cap.fb_w; H = cap.fb_h;
+        g_width = W; g_height = H;
         logf_("检测到输出: %dx%d (format 0x%x)", W, H, cap.fb_format);
     }
 
@@ -2405,30 +2523,38 @@ int main(int argc, char **argv) {
     /* ---------- 剪贴板同步 ---------- */
     clipboard_init(&cap);
 
-    /* ---------- HTTP 服务 ---------- */
-    int srv = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (srv < 0) die("socket: %s", strerror(errno));
-    int one = 1;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((uint16_t)port);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);      /* 只本机可访问 */
-    if (bind(srv, (struct sockaddr *)&sa, sizeof sa) < 0)
-        die("bind 127.0.0.1:%d 失败: %s", port, strerror(errno));
-    if (listen(srv, 64) < 0) die("listen: %s", strerror(errno));
-    fcntl(srv, F_SETFL, fcntl(srv, F_GETFL) | O_NONBLOCK);
+    /* ---------- HTTP 服务（-s 快照模式不需要：不占端口、不起线程） ----------
+     * ⚠️ 原来 -s 也绑端口起线程：跟正在运行的实例抢同一个端口直接 bind 失败，
+     *    SKILL/CI 被迫用 -p 8899 绕。快照模式只抓一帧存盘，根本不需要 HTTP。 */
+    int srv = -1;
+    pthread_t th = 0;
+    int have_th = 0;
+    if (!ppm_out) {
+        srv = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (srv < 0) die("socket: %s", strerror(errno));
+        int one = 1;
+        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons((uint16_t)port);
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);      /* 只本机可访问 */
+        if (bind(srv, (struct sockaddr *)&sa, sizeof sa) < 0)
+            die("bind 127.0.0.1:%d 失败: %s", port, strerror(errno));
+        if (listen(srv, 64) < 0) die("listen: %s", strerror(errno));
+        fcntl(srv, F_SETFL, fcntl(srv, F_GETFL) | O_NONBLOCK);
 
-    logf_("──────────────────────────────────────────────");
-    logf_(" 实时画面 + 鼠标键盘 → http://127.0.0.1:%d", port);
-    logf_(" 输出 %dx%d @ %d fps，MJPEG 下行 / WebSocket 上行", W, H, fps);
-    logf_(" 不建窗口、不抢焦点。Ctrl-C 退出。");
-    logf_("──────────────────────────────────────────────");
+        logf_("wstream %s", WSTREAM_VERSION);
+        logf_("──────────────────────────────────────────────");
+        logf_(" 实时画面 + 鼠标键盘 → http://127.0.0.1:%d", port);
+        logf_(" 输出 %dx%d @ %d fps，MJPEG 下行 / WebSocket 上行", W, H, fps);
+        logf_(" 不建窗口、不抢焦点。Ctrl-C 退出。");
+        logf_("──────────────────────────────────────────────");
 
-    pthread_t th;
-    if (pthread_create(&th, NULL, http_thread, (void *)(intptr_t)srv) != 0)
-        die("创建网络线程失败");
+        if (pthread_create(&th, NULL, http_thread, (void *)(intptr_t)srv) != 0)
+            die("创建网络线程失败");
+        have_th = 1;
+    }
 
     struct jpeg_enc enc;
     if (jpeg_open(&enc) < 0) die("初始化 JPEG 编码器失败");
@@ -2439,7 +2565,6 @@ int main(int argc, char **argv) {
 
     int cur = 0;
     long dropped = 0;
-    (void)dropped;
 
     while (g_run) {
         /* 发起抓帧 */
@@ -2494,9 +2619,18 @@ int main(int argc, char **argv) {
                     /* 设完等一次，保证合成器已采纳 */
                     wl_display_roundtrip(cap.display);
                 }
-                int req = g_clip_req;
-                g_clip_req = 0;
-                if (req) push_clipboard((unsigned long)req);
+                for (;;) {
+                    unsigned long req = 0;
+                    pthread_mutex_lock(&g_clip_req_mu);
+                    if (g_clip_req_n > 0) {
+                        req = g_clip_reqs[0];
+                        memmove(g_clip_reqs, g_clip_reqs + 1,
+                                (size_t)(--g_clip_req_n) * sizeof g_clip_reqs[0]);
+                    }
+                    pthread_mutex_unlock(&g_clip_req_mu);
+                    if (!req) break;
+                    push_clipboard(req);
+                }
                 continue;
             }
             /* 这一分支不能省：poll 超时也要 dispatch_pending，否则已到队列的事件
@@ -2513,17 +2647,22 @@ int main(int argc, char **argv) {
 
         if (cap.frame_failed) {
             dropped++;
-        } else if (has_viewers() || g_snap_want) {
-            /* 有人看流、或有人在等快照，都要编码 */
+        } else {
+            /* g_snap_want 由网络线程在锁里改，这里也要持锁读（裸读是数据竞争） */
+            pthread_mutex_lock(&g_snap_mu);
             int need_snap = g_snap_want;
-            unsigned long jlen = jpeg_encode(&enc, fb[cur].addr, W, H);
-            if (jlen > 0) {
-                snap_cache_last(enc.buf, jlen);   /* 给快照端点兜底 */
-                if (need_snap) snap_publish(enc.buf, jlen);
-                if (has_viewers()) push_frame(enc.buf, jlen);
-            } else if (need_snap) {
-                /* 编码失败也要唤醒，否则 HTTP 线程白等 3 秒 */
-                snap_publish(NULL, 0);
+            pthread_mutex_unlock(&g_snap_mu);
+            if (has_viewers() || need_snap) {
+                /* 有人看流、或有人在等快照，都要编码 */
+                unsigned long jlen = jpeg_encode(&enc, fb[cur].addr, W, H);
+                if (jlen > 0) {
+                    snap_cache_last(enc.buf, jlen);   /* 给快照端点兜底 */
+                    if (need_snap) snap_publish(enc.buf, jlen);
+                    if (has_viewers()) push_frame(enc.buf, jlen);
+                } else if (need_snap) {
+                    /* 编码失败也要唤醒，否则 HTTP 线程白等 3 秒 */
+                    snap_publish(NULL, 0);
+                }
             }
         }
         /* -s：抓一帧存 PPM 就退出 */
@@ -2550,15 +2689,18 @@ int main(int argc, char **argv) {
         }
     }
 
-    logf_("退出");
-    /* 网络线程还卡在 poll 里，先把它叫停再拆 clients[]，否则会踩已释放的 fd。
-     * 主线程已经不再碰 fd，所以这里持锁读完就够。 */
-    g_net_stop = 1;
-    pthread_mutex_lock(&g_cl_mu);
-    for (int i = 0; i < nclients; i++)
-        if (clients[i].fd >= 0) close(clients[i].fd);
-    pthread_mutex_unlock(&g_cl_mu);
-    close(srv);
+    if (dropped > 0) logf_("退出（丢弃 %ld 帧）", dropped);
+    else logf_("退出");
+    /* 网络线程还卡在 poll 里，先把它叫停再拆 clients[]，否则会踩已释放的 fd。 */
+    if (have_th) {
+        g_net_stop = 1;
+        pthread_mutex_lock(&g_cl_mu);
+        for (int i = 0; i < nclients; i++)
+            if (clients[i].fd >= 0) close(clients[i].fd);
+        pthread_mutex_unlock(&g_cl_mu);
+        pthread_join(th, NULL);
+    }
+    if (srv >= 0) close(srv);
     for (int i = 0; i < 2; i++) {
         wl_buffer_destroy(fb[i].wl_buf);
         munmap(fb[i].addr, fb[i].size);

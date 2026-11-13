@@ -2,6 +2,57 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.5.0] - 2026-11-13
+
+一次系统性审计后的加固版本：修了一批「平时不暴露、特定输入 / 并发 / 慢客户端下才炸」
+的 bug，补齐 WebSocket 协议合规性，新增 `/info` 端点让客户端不再猜分辨率。
+对正常用法的行为零变化，全套回归从 23 项扩到 39 项。
+
+### 新增
+
+| 新增项 | 说明 |
+|---|---|
+| `GET /info` | 返回 `{version,width,height,fps,quality}`，客户端据此自动换算坐标 |
+| 客户端自动探测分辨率 | `WStream()` 默认 `width/height=None`，首次 `move/click` 从 `/info` 探测；新增 `output_size()` |
+| WebSocket ping→pong / close 回应 | 按 RFC 6455 补齐控制帧处理 |
+| 16 项新回归断言 | /info、精确路径、ping/pong、未掩码/超尺寸帧断开、并发剪贴板、-s 不占端口、参数校验、list.sh 参数、客户端库 |
+
+### 修复
+
+| # | 现象 | 原因 |
+|---|---|---|
+| A | 并发取剪贴板偶尔读到半截 / 旧内容 | `clip_read_fd` 边读边写共享缓冲，与 HTTP 线程的读构成数据竞争 |
+| B | 沙箱里某个程序粘贴时整个画面卡死 | 剪贴板管道读写无超时，不可信程序 hold 住管道即冻死主循环 |
+| C | `/windows` 在窗口标题极长时越界写 | `o += snprintf(...)` 累加「想写的长度」，越过 cap 后 `cap-o` 下溢 |
+| D | 编码失败时取快照白等 3 秒 / UB | `snap_publish(NULL,0)` 触发 `memcpy(NULL,0)`，且失败路径不唤醒等待者 |
+| E | 发 >16KB 的 WS 帧后连接卡死空转 | 缓冲溢出静默 `in_len=0`，丢有效帧且不断开 |
+| F | 未掩码 / 分片帧被静默误解析 | `ws_parse_one` 忽略 fin、不校验掩码（RFC 6455 要求断开） |
+| G | 头被 TCP 分段时请求误判 | HTTP 头单次 recv 就解析；改循环读到 `\r\n\r\n`（3s 时限） |
+| H | `/notwindows` 命中 `/windows`、`/wsfoo` 被升级 | 端点用 strstr 子串匹配；改解析请求行精确比对 |
+| I | 本机 80 端口的网页能接管沙箱 | Origin 不带端口时无条件放行；改为仅 port==80 才信 |
+| J | 两个客户端同时读剪贴板只有一个收到响应 | 请求只存一个 id（还是 int 截断）；改环形队列 |
+| K | sway 重启后 `/windows` 永久读不到 | 取第一个 direntry 可能命中死 socket；改逐候选尝试 + 2s 超时 |
+| L | `-s` 快照与运行中实例抢端口失败 | 快照模式也绑端口起线程；改为不占端口（SKILL/CI 不再需要 `-p 8899`） |
+| M | `-q 0`/`-q 101` 黑屏、`-p 0` 随机端口 | 参数不校验；启动即报错（quality 1..100、port 1..65535） |
+| N | 客户端默认 1280x720 与 start.sh 默认 1600x1000 不符，坐标静默落错 | 写死默认值；改自动探测 |
+| O | 客户端收扩展长度头未收全时误判帧长 | `_recv_frame` 头不全时 off 留在 2、n 留在 126/127 |
+| P | `list.sh --url -p 8801` 过滤失效 | for+shift 解析错位，PORT_ARG 读成 "-p"；改 while+shift |
+| Q | `start.sh abc` 分辨率悄悄回退默认 | SIZE/PORT 不校验、wlr-randr 失败静默；改校验 + 警告 |
+| R | 纯 agent（无浏览器）场景也 10fps 编码耗 CPU | `has_viewers` 把 WS 客户端当观众；只数流客户端 |
+| S | 键盘创建失败连累鼠标不可用 | `input_init` 早退；两者独立创建 |
+
+### 卫生
+
+- `push_keymap_snapshot` 改 static、去无用参数；删与现状矛盾的陈旧注释（旧相对位移段、「每键推 keymap」段）
+- 退出时报告丢帧数；`g_snap_want` 主循环改持锁读；前端 `setInt16`→`setUint16`（线格式不变）
+- `utf8_next` 拒绝 overlong 序列；`save_ppm` 检查 malloc；`docs/PROTOCOLS.md` §三 修正为实际的 motion_absolute 实现
+
+### 验证
+
+- `./build.sh` 零警告（`-Wall -Wextra`）
+- `tests/wstest.py` **39/39**（含 16 项新断言），`tests/lifecycle.py` **15/15**
+- 停机后 wstream/sway-nocap/sway/desktop.sh/alacritty/x11probe 残留全 0
+
 ## [1.4.2] - 2026-10-25
 
 修**测试自身**的 flake。生产代码一行没改 —— 坏的是测试会干扰自己。

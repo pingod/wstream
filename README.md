@@ -166,7 +166,7 @@ XDG_RUNTIME_DIR=/path/to/run WAYLAND_DISPLAY=wayland-1 ./wstream -p 8765 -f 10 -
 | `-p PORT` | HTTP 端口（**只监听 127.0.0.1**） | `8765` |
 | `-f FPS` | 帧率，范围 1..30 | `10` |
 | `-q QUALITY` | JPEG 质量，范围 1..100 | `70` |
-| `-s FILE.ppm` | 抓一帧存 PPM 后退出（不需要浏览器，用于验证） | — |
+| `-s FILE.ppm` | 抓一帧存 PPM 后退出（不占端口，可与运行中实例共存） | — |
 | `-v` | 详细日志（会把 keymap 落盘到 `/tmp/wstream-keymap.txt`） | off |
 
 ### 环境变量
@@ -251,6 +251,7 @@ Content-Length: 81234
 | `GET /stream.mjpg` | MJPEG 流 | 浏览器 `<img>` |
 | `GET /snapshot.jpg` | 单帧 JPEG，带 800ms 缓存 | agent 截图 |
 | `GET /windows` | 窗口列表 + 精确坐标（读 sway IPC） | agent 定位 |
+| `GET /info` | 沙箱元信息 `{version,width,height,fps,quality}` | 客户端自动换算坐标 |
 | `WS /ws` | 输入注入 + 剪贴板 | 浏览器 / 脚本 |
 
 `/snapshot.jpg` 和 `/windows` 是为 agent 加的：前者让它「看一眼现在什么样」
