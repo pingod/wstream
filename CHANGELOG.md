@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [0.8] - 2026-11-13
+
+### 修复
+
+- **「发送快捷键」按钮点了没反应**：修饰键下拉的 `<option value>` 用的是 `C/A/S`，
+  而 `MODS` 表的键是 `Ctrl/Alt/Shift/Super`，`MODS["C"]` 为 undefined → 条件
+  `if(mk&&ck)` 永不成立，一帧都不发。改为 value 与表键一致。
+- **组合键重复发送**：capture 阶段的 keydown 与 `#k` 的 keydown 各发一次 Ctrl+键。
+  删除 capture 处理器，浏览器会截胡的组合键改由「发送」按钮显式触发。
+- `evcode()` 对 Tab/F5 等多字符键取值错误（取到首字母码），已按 `KEYSYNC` 正确映射。
+
 ## [0.7] - 2026-11-13
 
 ### 变更
