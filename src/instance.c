@@ -6,7 +6,7 @@
  *   - 进程归属用 XDG_RUNTIME_DIR == <root>/run，绝不按进程名裸杀（坑 21/23）
  *   - 「活着」= 进程在且非僵尸（容器里 PID 1 不 reap，坑 26 的同源教训）
  *   - 「沙箱可用」= socket 真能握手，不是文件存在（坑 26）
- *   - own_pids 必须含 desktop.sh 和窗口程序，否则每轮漏一批孤儿（坑 25）
+ *   - 进程清理按 XDG_RUNTIME_DIR 归属（不限名），--app 的任意程序也能清掉（坑 25 的推广）
  *   - 实例目录被删后仍能从 cmdline 认出孤儿（坑 27）
  *
  * 隔离红线：本模块只起/停 XDG_RUNTIME_DIR 指向 <root>/run 的无头沙箱，
@@ -41,14 +41,6 @@
 #define DEFAULT_ROOT "/tmp/wstream"
 #define DEFAULT_PORT 8765
 
-/* 沙箱里会出现的进程名。列多了不会误伤用户桌面 —— 归属判据仍是
- * XDG_RUNTIME_DIR == <root>/run（坑 25）。stop-all 额外认 Xwayland。
- * 含 sh/sleep：清掉 desktop.sh 与终端刷新循环留下的孤儿 sleep/sh
- * （原白名单没有它们，每轮会漏；归属判据保证不误伤用户桌面）。 */
-static const char *SANDBOX_APPS[] = {
-    "wstream", "sway-nocap", "sway", "desktop.sh",
-    "alacritty", "foot", "kitty", "xterm", "sh", "sleep", NULL
-};
 static const char *STOPALL_APPS[] = {
     "wstream", "sway-nocap", "sway", "Xwayland", "alacritty", "desktop.sh",
     "sh", "sleep", NULL
@@ -245,17 +237,22 @@ static int belongs_to_root(pid_t pid, const char *root) {
     return !strcmp(rt, want);
 }
 
-/* 收集本实例（root）白名单里、非僵尸的进程。返回个数。 */
+/* 收集归属本实例（root）的所有非僵尸进程（XDG_RUNTIME_DIR == root/run，不限进程名）。
+ * 归属判据保证不误伤用户桌面（其 XDG_RUNTIME_DIR 是 /run/user/<uid>）；
+ * 也能清掉 --app 启动的任意程序及其子进程（进程名不在任何白名单里）。 */
 static int own_pids(const char *root, pid_t *pids, int max) {
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    struct dirent *de;
     int n = 0;
-    for (int a = 0; SANDBOX_APPS[a]; a++) {
-        pid_t tmp[256];
-        int c = scan_comm(SANDBOX_APPS[a], tmp, 256);
-        for (int i = 0; i < c && n < max; i++) {
-            if (is_zombie(tmp[i])) continue;
-            if (belongs_to_root(tmp[i], root)) pids[n++] = tmp[i];
-        }
+    while (n < max && (de = readdir(d))) {
+        if (!isdigit((unsigned char)de->d_name[0])) continue;
+        pid_t pid = (pid_t)atoi(de->d_name);
+        if (pid <= 0 || pid == getpid()) continue;
+        if (is_zombie(pid)) continue;
+        if (belongs_to_root(pid, root)) pids[n++] = pid;
     }
+    closedir(d);
     return n;
 }
 
@@ -442,7 +439,7 @@ static pid_t spawn_wstream(const char *root, int port, const char *wl) {
         setenv("XDG_RUNTIME_DIR", rundir, 1);
         setenv("WAYLAND_DISPLAY", wl, 1);
         /* ⚠️ 必须 exec 真实路径，不能 exec "/proc/self/exe"：Linux 把 comm 设成
-         * 路径末段，exec /proc/self/exe 会让 comm 变成 "exe"，list/stop-all/own_pids
+         * 路径末段，exec /proc/self/exe 会让 comm 变成 "exe"，list/stop-all
          * 按名字就找不到它了。readlink 解析出真实路径，comm 才是 "wstream"。 */
         char self[512];
         ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
@@ -483,15 +480,33 @@ static int copy_file(const char *src, const char *dst) {
 
 /* ---------------------------------------------------------------- 沙箱内容 */
 
-static const char DESKTOP_SH[] =
-    "#!/bin/sh\n"
-    "alacritty --class AgentTop -e sh -c 'c=1; while :; do printf "
-    "\"\\033[1;36m窗口 1\\033[0m  %s  第 %d 次刷新\\n\" \"$(date +%H:%M:%S)\" $c; "
-    "c=$((c+1)); sleep 1; done' &\n"
-    "sleep 1\n"
-    "alacritty --class AgentSub -e sh -c 'n=1; while :; do echo \"窗口 2  计数器 $n\"; "
-    "n=$((n+1)); sleep 1; done' &\n"
-    "sleep 36000\n";
+/* 生成 desktop.sh：窗口1 固定为交互命令行；窗口2 默认是计数器，--app 指定时
+ * 改为直接启动该程序（原生窗口，GUI 程序可用）。stop 按 XDG_RUNTIME_DIR 归属
+ * 清理，故任意程序名都能收掉。 */
+static int write_desktop_sh(const char *root, const char *app) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/desktop.sh", root);
+    char buf[4096];
+    int n;
+    if (app && *app) {
+        n = snprintf(buf, sizeof buf,
+            "#!/bin/sh\n"
+            "alacritty --class AgentTop -e sh -i &\n"
+            "sleep 1\n"
+            "%s &\n"
+            "sleep 36000\n", app);
+    } else {
+        n = snprintf(buf, sizeof buf,
+            "#!/bin/sh\n"
+            "alacritty --class AgentTop -e sh -i &\n"
+            "sleep 1\n"
+            "alacritty --class AgentSub -e sh -c 'n=1; while :; do echo \"窗口 2  计数器 $n\"; "
+            "n=$((n+1)); sleep 1; done' &\n"
+            "sleep 36000\n");
+    }
+    if (n < 0 || (size_t)n >= sizeof buf) return -1;
+    return write_file(path, buf, (size_t)n, 0755);
+}
 
 static void dump_log_tail(const char *path) {
     char buf[8192];
@@ -507,7 +522,7 @@ static void dump_log_tail(const char *path) {
 
 /* ---------------------------------------------------------------- start */
 
-static int start_instance(const char *root, int port, const char *size) {
+static int start_instance(const char *root, int port, const char *size, const char *app) {
     char wl[256] = "";
     find_wl_socket(root, wl, sizeof wl);
 
@@ -523,8 +538,7 @@ static int start_instance(const char *root, int port, const char *size) {
         snprintf(dir, sizeof dir, "%s/run", root); chmod(dir, 0700);
 
         char path[512];
-        snprintf(path, sizeof path, "%s/desktop.sh", root);
-        write_file(path, DESKTOP_SH, sizeof DESKTOP_SH - 1, 0755);
+        if (write_desktop_sh(root, app) < 0) idie("写入 desktop.sh 失败");
 
         char cfg[1024];
         int cn = snprintf(cfg, sizeof cfg,
@@ -645,7 +659,7 @@ static int stop_instance(const char *root) {
         }
         closedir(d);
     }
-    /* 兜底：只杀归属本沙箱的进程，绝不误伤用户桌面 */
+    /* 兜底：按归属杀掉本沙箱全部进程（不限名，含 --app 及其子进程），绝不误伤用户桌面 */
     pid_t pids[512];
     int n = own_pids(root, pids, 512);
     for (int i = 0; i < n; i++) kill(pids[i], SIGTERM);
@@ -655,6 +669,9 @@ static int stop_instance(const char *root) {
         if (n == 0) break;
         msleep(200);
     }
+    /* 仍不退出的强杀 */
+    n = own_pids(root, pids, 512);
+    for (int i = 0; i < n; i++) kill(pids[i], SIGKILL);
     ilog("已停止");
     return 0;
 }
@@ -956,7 +973,8 @@ static void usage(void) {
     fprintf(stderr,
         "wstream %s — 隔离的无头 Wayland 虚拟桌面 + 实时画面/输入\n\n"
         "用法：\n"
-        "  wstream start [WxH]        起一个隔离沙箱并推流（默认 1600x1000，端口 8765）\n"
+        "  wstream start [WxH] [--app/-A 程序]  起隔离沙箱并推流（默认 1600x1000，端口 8765）\n"
+        "                             --app/-A：沙箱打开指定程序；默认开命令行+计数器两窗口\n"
         "  wstream stop               停止本实例（WSTREAM_ROOT 指定，默认 /tmp/wstream）\n"
         "  wstream list [--url] [-p PORT]   列出运行中的实例\n"
         "  wstream stop-all [--yes] [--dry-run]   停止所有实例\n"
@@ -977,10 +995,21 @@ int instance_main(int argc, char **argv) {
     if (!strcmp(cmd, "start")) {
         const char *ports = getenv("WSTREAM_PORT");
         int port = ports && *ports ? atoi(ports) : DEFAULT_PORT;
-        const char *size = (argc >= 2 && argv[1][0]) ? argv[1] : "1600x1000";
+        const char *size = "1600x1000";
+        const char *app = NULL;
+        for (int i = 1; i < argc; i++) {
+            if (!strcmp(argv[i], "--app") || !strcmp(argv[i], "-A")) {
+                if (i + 1 >= argc) idie("--app/-A 需要一个程序名");
+                app = argv[++i];
+            } else if (argv[i][0] == '-') {
+                idie("未知选项：%s（用法：wstream start [WxH] [--app/-A 程序]）", argv[i]);
+            } else {
+                size = argv[i];
+            }
+        }
         if (!valid_size(size)) idie("分辨率格式应为 WxH（如 1600x1000），收到：%s", size);
         if (port < 1 || port > 65535) idie("端口越界（1..65535）：%d", port);
-        return start_instance(root, port, size);
+        return start_instance(root, port, size, app);
     }
     if (!strcmp(cmd, "stop")) return stop_instance(root);
     if (!strcmp(cmd, "list")) return cmd_list(argc, argv);

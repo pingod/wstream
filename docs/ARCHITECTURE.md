@@ -282,7 +282,7 @@ wstream start
   │
   ├─ 2. 没有 → 创建
   │     ├─ mkdir /tmp/wstream/{run,cfg/sway,out}
-  │     ├─ 写 desktop.sh（两个不停刷新的终端）
+  │     ├─ 写 desktop.sh（命令行 + 计数器；--app 时换成指定程序）
   │     ├─ 写 sway config（含 exec desktop.sh）
   │     ├─ setsid env -u DISPLAY sway --unsupported-gpu
   │     │    └─ WLR_BACKENDS=headless WLR_RENDERER=pixman

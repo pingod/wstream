@@ -145,12 +145,14 @@ sudo pacman -S --needed gcc pkgconf wayland wayland-protocols \
 ```bash
 ./wstream start              # 默认 1600x1000
 ./wstream start 1920x1080    # 指定分辨率
+./wstream start --app firefox  # 沙箱打开指定程序（窗口1 仍是命令行）
 ./wstream stop               # 停止
 ```
 
 wstream start 会：
 1. 起一个 `sway --unsupported-gpu`，`WLR_BACKENDS=headless`（无头）
-2. 在沙箱里跑两个不停刷新的终端（方便确认画面是实时的）
+2. 在沙箱里开两个窗口：一个**交互命令行** + 一个**实时计数器**（方便确认画面是实时的）；
+   用 `--app/-A 程序` 时把计数器窗口换成该程序（原生窗口，GUI 可用）
 3. 起 `wstream` 监听 `127.0.0.1:8765`
 
 ### 直接推流任意 wlroots 合成器

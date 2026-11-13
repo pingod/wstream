@@ -63,16 +63,41 @@ def pids_of(root):
     return out
 
 
-def run_start(root, port, size="1024x600", timeout=120):
+def run_start(root, port, size="1024x600", timeout=120, app=None):
     env = dict(os.environ, WSTREAM_ROOT=root, WSTREAM_PORT=str(port))
-    return subprocess.run([BIN, "start", size], env=env, capture_output=True,
-                          text=True, timeout=timeout)
+    cmd = [BIN, "start", size]
+    if app:
+        cmd += ["--app", app]
+    return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
 
 
 def run_stop(root, timeout=60):
     env = dict(os.environ, WSTREAM_ROOT=root)
     return subprocess.run([BIN, "stop"], env=env, capture_output=True,
                           text=True, timeout=timeout)
+
+
+def runtime_pids(root):
+    """XDG_RUNTIME_DIR == root/run 的所有非僵尸 pid（不限进程名）。
+    比 pids_of 的白名单更全：能抓到 --app 启动的任意程序。"""
+    want = os.path.join(root, "run")
+    out = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                envs = f.read().decode("utf-8", "replace").split("\0")
+            rt = [e for e in envs if e.startswith("XDG_RUNTIME_DIR=")]
+            if not rt or rt[0].split("=", 1)[1] != want:
+                continue
+            with open(f"/proc/{pid}/stat") as f:
+                if f.read().split()[2] == "Z":
+                    continue
+            out.append(pid)
+        except OSError:
+            continue
+    return out
 
 
 def port_http(port):
@@ -186,6 +211,29 @@ def main():
 
         # 兜底清理，别把垃圾留给用户
         shutil.rmtree(root, ignore_errors=True)
+
+    # ---------- 5. --app 打开指定程序，stop 按归属清理 ----------
+    print("── 5. --app 打开指定程序且 stop 按归属清理 ──")
+    aroot = root + "-app"
+    aport = port + 1
+    run_stop(aroot)
+    shutil.rmtree(aroot, ignore_errors=True)
+    r = run_start(aroot, aport, app="tail -f /dev/null")
+    check("--app 实例能起来", r.returncode == 0, r.stderr[-300:])
+
+    def _comm(pid):
+        try:
+            return open(f"/proc/{pid}/comm").read().strip()
+        except OSError:
+            return ""
+    # tail 不在任何白名单里，验证它确实在沙箱内被启动
+    has_tail = any(_comm(p) == "tail" for p in runtime_pids(aroot))
+    check("--app 程序在沙箱内启动", has_tail, f"(runtime_pids={runtime_pids(aroot)})")
+    run_stop(aroot)
+    time.sleep(1)
+    left = runtime_pids(aroot)
+    check("--app stop 零残留（按归属，不限名）", len(left) == 0, f"(残留={left})")
+    shutil.rmtree(aroot, ignore_errors=True)
 
     print()
     print(f"通过 {len(PASSES)} 项，失败 {len(FAILS)} 项")

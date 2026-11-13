@@ -39,6 +39,7 @@ metadata:
 cd ~/githome/wstream          # 或任何 clone 下来的位置
 ./build.sh                    # 首次需要编译
 ./wstream start              # 默认 1600x1000，端口 8765
+./wstream start --app <程序>   # 可选：沙箱打开指定程序（默认开命令行+计数器两窗口）
 ```
 
 然后告诉用户：**浏览器打开 <http://127.0.0.1:8765>，点一下画面就能接管**。

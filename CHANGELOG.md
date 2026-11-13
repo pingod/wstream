@@ -2,6 +2,15 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 新增
+
+- **`wstream start --app/-A <程序>`**：沙箱默认打开指定程序（原生窗口，GUI 可用）；
+  不指定时默认开「交互命令行 + 实时计数器」两个窗口（原先是两个计数器）。
+- `stop`/`stop-all` 清理改为按 `XDG_RUNTIME_DIR` 归属（不限进程名），`--app` 启动的
+  任意程序及其子进程都能收掉；stop 增加超时强杀。lifecycle 增 `--app` 回归（第 5 节）。
+
 ## [0.2] - 2026-11-13
 
 首个公开发版（重新起版本号；此前 1.x 为内部开发序列）。内容即 1.6.0 的完整状态：
