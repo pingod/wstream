@@ -480,7 +480,7 @@ static int copy_file(const char *src, const char *dst) {
 
 /* ---------------------------------------------------------------- 沙箱内容 */
 
-/* 生成 desktop.sh：窗口1 固定为交互命令行；窗口2 默认是计数器，--app 指定时
+/* 生成 desktop.sh：窗口1 固定为交互命令行；窗口2 默认是毫秒时钟，--app 指定时
  * 改为直接启动该程序（原生窗口，GUI 程序可用）。stop 按 XDG_RUNTIME_DIR 归属
  * 清理，故任意程序名都能收掉。 */
 static int write_desktop_sh(const char *root, const char *app) {
@@ -500,8 +500,7 @@ static int write_desktop_sh(const char *root, const char *app) {
             "#!/bin/sh\n"
             "alacritty --class AgentTop -e sh -i &\n"
             "sleep 1\n"
-            "alacritty --class AgentSub -e sh -c 'n=1; while :; do echo \"窗口 2  计数器 $n\"; "
-            "n=$((n+1)); sleep 1; done' &\n"
+            "alacritty --class AgentSub -e sh -c 'while :; do printf \"窗口 2  %%s.%%s\\n\" \"$(date +%%H:%%M:%%S)\" \"$(date +%%N | cut -c1-3)\"; sleep 0.05; done' &\n"
             "sleep 36000\n");
     }
     if (n < 0 || (size_t)n >= sizeof buf) return -1;
@@ -974,7 +973,7 @@ static void usage(void) {
         "wstream %s — 隔离的无头 Wayland 虚拟桌面 + 实时画面/输入\n\n"
         "用法：\n"
         "  wstream start [WxH] [--app/-A 程序]  起隔离沙箱并推流（默认 1600x1000，端口 8765）\n"
-        "                             --app/-A：沙箱打开指定程序；默认开命令行+计数器两窗口\n"
+        "                             --app/-A：沙箱打开指定程序；默认开命令行+毫秒时钟两窗口\n"
         "                             多实例：重复 start 自动新建；显式 WSTREAM_ROOT/WSTREAM_PORT 复用指定实例\n"
         "  wstream stop               停止本实例（WSTREAM_ROOT 指定，默认 /tmp/wstream）\n"
         "  wstream list [--url] [-p PORT]   列出运行中的实例\n"

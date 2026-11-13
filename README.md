@@ -152,8 +152,8 @@ sudo pacman -S --needed gcc pkgconf wayland wayland-protocols \
 
 wstream start 会：
 1. 起一个 `sway --unsupported-gpu`，`WLR_BACKENDS=headless`（无头）
-2. 在沙箱里开两个窗口：一个**交互命令行** + 一个**实时计数器**（方便确认画面是实时的）；
-   用 `--app/-A 程序` 时把计数器窗口换成该程序（原生窗口，GUI 可用）
+2. 在沙箱里开两个窗口：一个**交互命令行** + 一个**毫秒时钟**（方便确认画面是实时的）；
+   用 `--app/-A 程序` 时把时钟窗口换成该程序（原生窗口，GUI 可用）
 3. 起 `wstream` 监听 `127.0.0.1:8765`
 
 ### 直接推流任意 wlroots 合成器
