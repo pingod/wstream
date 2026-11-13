@@ -38,6 +38,7 @@ metadata:
 ```bash
 cd ~/githome/wstream          # 或任何 clone 下来的位置
 ./build.sh                    # 首次需要编译
+./wstream version            # 当前版本（如 0.3）
 ./wstream start              # 默认 1600x1000，端口 8765
 ./wstream start --app <程序>   # 可选：沙箱打开指定程序（默认开命令行+计数器两窗口）
 ```
@@ -106,6 +107,12 @@ API 速查见 `clients/README.md`。下面两种方式是它的底层实现，
 | `2` | button（1=左 2=中 3=右） | state（1=按下 0=抬起） | 鼠标按键 |
 | `3` | steps（**int16**，负=向下） | 0 | 滚轮 |
 | `4` | evdev 扫描码 | state（1=按下 0=抬起） | 键盘 |
+| `6` | action（1=取权 0=释放） | 0 | 输入所有权 |
+| `9` | 宽（px） | 高（px） | 请求重设输出尺寸（前端 observe 模式） |
+
+**扩展帧（>8 字节）**：`[5]` 文本（8 字节头 + UTF-8 负载）、`[7]` 写沙箱剪贴板、
+`[8]` 读沙箱剪贴板、`[11]` keysym 直传（`[8..11]` 为 UTF-32 码点；注入 é/ñ/ü 等
+非 ASCII 可打印字符，不受键盘布局影响）。
 
 **Python 示例**（可直接复制用）：
 
@@ -326,6 +333,12 @@ ffmpeg -i /tmp/shot.ppm /tmp/shot.png
 
 然后用 `read_image` 看 `/tmp/shot.png`。
 
+### 视频与分辨率（0.3）
+- **H.264**：`ws://127.0.0.1:8765/ws?video=h264` 走 x264(zerolatency) + 前端 WebCodecs；
+  默认仍是 MJPEG（`<img>` 原生支持，兼容性最好）。需要浏览器支持 `VideoDecoder`。
+- **分辨率自适应**：页面视口变化（<32px 去抖）→ 前端发 type 9 请求沙箱重设分辨率；
+  `GET /info` 返回沙箱当前宽高/版本，快照与它同源。
+
 ---
 
 ## 4. 验证隔离性（改动启动逻辑后必做）
@@ -379,6 +392,7 @@ hyprctl cursorpos
 | **XWayland 程序注不进去** | firefox / Electron 默认走 X11，wstream 只能操作原生 Wayland 客户端。要让它们走 Wayland：加 `MOZ_ENABLE_WAYLAND=1`（firefox）或 `--ozone-platform=wayland`（Electron/Chromium） |
 | 只能本机访问 | 只监听 `127.0.0.1`；已校验 `Host`/`Origin`，但无 token、无 TLS |
 | 有 `/snapshot.jpg`、`/windows`、`/info` | 单帧截图、窗口坐标、沙箱元信息（尺寸/版本），不用装 grim |
+| H.264 需 WebCodecs | `?video=h264`；浏览器不支持时回落 MJPEG |
 | Xwayland 里的中文 | 逐键到不了，但**走剪贴板可以**（type 7 + Ctrl+V） |
 | 无音频 | 只传画面 |
 | 无剪贴板同步 | 沙箱与宿主机剪贴板不通 |
