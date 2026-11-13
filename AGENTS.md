@@ -19,6 +19,10 @@
 但**发版前必须看远程 CI**：1.3.x 六个版本里 CI 一直红着，就是因为只看本地。
 **发版是唯一「必须两边都绿」的时刻。**
 
+**用户已授权：功能完成后本地 + CI 双绿就直接发版，不用再问。** 流程仍是
+升 `WSTREAM_VERSION` → 本地全套 → 推送 → 等 CI 绿 → `git tag vX.Y` 推送 →
+`gh release create`（附 `wstream-vX.Y-x86_64-linux.tar.gz` 二进制包）。
+
 不要做的事：本地跑完 → 推送 → 等 CI 也跑完。同一份断言跑两次，第二次没有新信息。
 
 参考 `tests/README.md`。CI 定义在 `.github/workflows/build.yml`。
