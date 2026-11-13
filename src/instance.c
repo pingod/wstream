@@ -286,7 +286,10 @@ static int port_serving(int port) {
 
 /* ---------------------------------------------------------------- 沙箱探测 */
 
-/* 找 <root>/run/wayland-* 的第一个。找到返回 0 并写 out。 */
+/* 找 <root>/run/wayland-* 的**真 socket**。找到返回 0 并写 out。
+ * ⚠️ 必须跳过 wayland-N.lock（sway 的锁文件）：readdir 无序，可能先读到 .lock，
+ * 拿它当 socket 会「连不上 Wayland」。原 start.sh 用排序的 ls wayland-* | head -1
+ * 恰好总排在 .lock 前面才避开；C 里必须显式排除（CI 裸容器实测踩到）。 */
 static int find_wl_socket(const char *root, char *out, size_t cap) {
     char dir[512];
     snprintf(dir, sizeof dir, "%s/run", root);
@@ -295,11 +298,12 @@ static int find_wl_socket(const char *root, char *out, size_t cap) {
     struct dirent *de;
     int found = -1;
     while ((de = readdir(d))) {
-        if (!strncmp(de->d_name, "wayland-", 8)) {
-            snprintf(out, cap, "%s", de->d_name);
-            found = 0;
-            break;
-        }
+        if (strncmp(de->d_name, "wayland-", 8)) continue;
+        size_t l = strlen(de->d_name);
+        if (l >= 5 && !strcmp(de->d_name + l - 5, ".lock")) continue;  /* 跳过锁文件 */
+        snprintf(out, cap, "%s", de->d_name);
+        found = 0;
+        break;
     }
     closedir(d);
     return found;

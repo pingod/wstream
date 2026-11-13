@@ -101,6 +101,15 @@ def main():
         r = run_start(root, port)
         check("实例能起来", r.returncode == 0, r.stderr[-300:])
         check("端口可服务", port_http(port) == 200)
+        # CI 裸容器踩到的坑：sway 同时建 wayland-N 与 wayland-N.lock，readdir 无序
+        # 时可能把 .lock 当 socket 写进 wl_name → 连不上。必须指向真 socket。
+        import stat as _stat
+        wl_name = open(os.path.join(root, "wl_name")).read().strip()
+        wl_path = os.path.join(root, "run", wl_name)
+        check("wl_name 指向真 socket（非 .lock）",
+              not wl_name.endswith(".lock") and os.path.exists(wl_path)
+              and _stat.S_ISSOCK(os.stat(wl_path).st_mode),
+              f"(wl_name={wl_name})")
 
         during = pids_of(root)
         names = {n for n, _ in during}

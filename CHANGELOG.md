@@ -14,9 +14,15 @@
 - 版本单一来源 `src/instance.h` 的 `WSTREAM_VERSION`（现为 `0.2`）；`-v`/`--version`/`-V`/
   `wstream version`/`GET /info` 同源。README 增「版本管理」节。
 
+### 修复
+
+- **`wstream start` 在裸容器里连不上 Wayland**：sway 同时建 `wayland-N` 与 `wayland-N.lock`，
+  C 版 `find_wl_socket` 用 `readdir`（无序）可能把 `.lock` 当 socket（原 start.sh 用排序的
+  `ls | head -1` 恰好避开）。改为显式跳过 `.lock`；lifecycle 增「wl_name 必须是真 socket」断言。
+
 ### 验证
 
-- `./build.sh` 零警告；`tests/wstest.py` **41/41**、`tests/lifecycle.py` **15/15**。
+- `./build.sh` 零警告；`tests/wstest.py` **41/41**、`tests/lifecycle.py` **16/16**。
 - `-v`/`--version`/`-V`/`version`/`/info` 均输出 `0.2`；start/stop 零残留。
 
 ## [1.6.0] - 2026-11-13
