@@ -47,7 +47,7 @@ XDG_CACHE_HOME=$PWD/.ghcache gh release create ...
 这个坑我已经犯过好几次了（见 README「已知坑」、SKILL.md）。
 
 要用 `pkill` 就加 `-x`（精确匹配进程名，不匹配整条 cmdline）。
-清 wstream 实例用 `./scripts/stop-all.sh`，不要自己拼 `pkill`。
+清 wstream 实例用 `./wstream stop-all`，不要自己拼 `pkill`。
 
 ## 绝对不要碰用户真实桌面
 

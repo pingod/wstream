@@ -961,11 +961,11 @@ def main():
         check("越界 -p 被拒绝", rp.returncode == 2 and "端口" in rp.stderr,
               f"(rc={rp.returncode} err={rp.stderr[-100:]})")
 
-        # 9i. list.sh 参数解析：--url -p PORT 必须能过滤出本实例
-        rl = subprocess.run([os.path.join(REPO, "scripts", "list.sh"),
+        # 9i. list 子命令参数解析：--url -p PORT 必须能过滤出本实例
+        rl = subprocess.run([os.path.join(REPO, "wstream"), "list",
                              "--url", "-p", str(PORT)],
                             capture_output=True, text=True, timeout=15)
-        check("list.sh --url -p 正确过滤", f"http://127.0.0.1:{PORT}" in rl.stdout,
+        check("list --url -p 正确过滤", f"http://127.0.0.1:{PORT}" in rl.stdout,
               f"(out={rl.stdout!r})")
 
         # 9j. 客户端库：自动探测分辨率 + 扩展长度头收帧

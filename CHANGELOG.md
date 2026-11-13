@@ -2,6 +2,39 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.6.0] - 2026-11-13
+
+把实例编排从 shell 脚本搬进二进制：`scripts/*.sh` 废弃删除，统一为 `wstream` 子命令。
+编排逻辑（起 sway、归属判据、僵尸/死 socket 处理、孤儿清理）逐条忠实移植到
+`src/instance.c`，并修掉移植中暴露的三个 bug。实时抓帧/注入核心（`stream_main`）不变。
+
+### 新增
+
+| 子命令 | 取代 | 说明 |
+|---|---|---|
+| `wstream start [WxH]` | `scripts/start.sh` | 起隔离沙箱 + 推流（env `WSTREAM_ROOT`/`WSTREAM_PORT`） |
+| `wstream stop` | `scripts/start.sh stop` | 停本实例 |
+| `wstream list [--url] [-p PORT]` | `scripts/list.sh` | 列实例 |
+| `wstream stop-all [--yes] [--dry-run]` | `scripts/stop-all.sh` | 停所有实例 |
+| `wstream dashboard [-o OUT]` | `scripts/dashboard.sh` | 生成总览页 |
+| `wstream version` / `help` / `--version` / `--help` | — | 版本与用法 |
+
+裸 `./wstream [-p/-f/-q/-s/-v]` 与 `wstream stream ...` 仍是纯推流客户端，行为不变。
+
+### 修复（移植中暴露）
+
+| # | 现象 | 原因 |
+|---|---|---|
+| A | `list`/`stop-all`/`own_pids` 按名字找不到 wstream 子进程 | `execl("/proc/self/exe",…)` 让 comm 变成路径末段 "exe"；改 readlink 解析真实路径再 exec，comm 才是 "wstream" |
+| B | `list` 把自己算成一个离线实例（`/run/user`） | `wstream list` 自身 comm 也是 "wstream"；跳过 `getpid()` 且只认 `<root>/run` 实例结构 |
+| C | 每轮 stop 漏掉 `sleep`/`sh` 孤儿（原脚本也有，测试没抓） | 白名单补 `sh`/`sleep`（归属判据保证不误伤用户桌面）；lifecycle 残留检查同步加这两个名字 |
+
+### 验证
+
+- `./build.sh` 零警告（`-Wall -Wextra`）
+- `tests/wstest.py` **41/41**、`tests/lifecycle.py` **15/15**（均已改用二进制子命令起停）
+- 手动起停多实例：`list` 正确、`stop`/`stop-all` 零残留（含 sh/sleep）
+
 ## [1.5.1] - 2026-11-13
 
 修一个隔离脚枪：**裸 `./wstream` 会串流并注入你的真实桌面**。

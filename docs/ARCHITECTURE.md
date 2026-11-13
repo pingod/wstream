@@ -272,10 +272,10 @@ const M = { 65: 30, 66: 48, ... };  /* 'A' → 30 */
 
 这个设计让用户能明确控制"什么时候 agent 在操作沙箱"，避免误操作。
 
-## 七、启动脚本流程
+## 七、启动流程（wstream start，src/instance.c）
 
 ```
-scripts/start.sh
+wstream start
   │
   ├─ 1. 检查是否已有沙箱（/tmp/wstream/run/wayland-*）
   │     └─ 有 → 复用
@@ -290,7 +290,7 @@ scripts/start.sh
   │     └─ wlr-randr 设分辨率
   │
   ├─ 3. 起 wstream
-  │     └─ setsid env -u DISPLAY wstream -p 8765
+  │     └─ setsid env -u DISPLAY wstream stream -p 8765
   │
   └─ 4. 打印访问地址
 ```

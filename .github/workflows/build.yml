@@ -51,9 +51,9 @@ jobs:
           # 预热 fontconfig 缓存：容器里首次运行要建缓存，否则 sway 启动会慢很多
           fc-cache -f >/dev/null 2>&1 || true
 
-          ./scripts/start.sh 1280x720
+          ./wstream start 1280x720
 
-          # start.sh 已等到 socket 就绪，再给 wstream 一点时间连上
+          # wstream start 已等到 socket 就绪，再给 wstream 一点时间连上
           for i in $(seq 1 40); do
             curl -fsS -o /dev/null http://127.0.0.1:8765/ 2>/dev/null && break
             sleep 0.5
@@ -68,7 +68,7 @@ jobs:
           # → 流里没有数据。这属于环境限制，不是抓帧功能有问题。
           WL=$(cat /tmp/wstream/wl_name)
           XDG_RUNTIME_DIR=/tmp/wstream/run WAYLAND_DISPLAY="$WL" \
-            ./wstream -p 8899 -s /tmp/shot.ppm
+            ./wstream -s /tmp/shot.ppm
           test -s /tmp/shot.ppm
           echo "snapshot OK ($(stat -c%s /tmp/shot.ppm) bytes)"
 
@@ -77,13 +77,13 @@ jobs:
           echo
           head -2 /tmp/shot.ppm | tail -1 | grep -qx "1280 720"
 
-          ./scripts/start.sh stop
+          ./wstream stop
 
       - name: 键鼠注入回归测试
         run: |
           set -x
           # 这个测试会自己起沙箱，所以前面那份已经停掉了
-          ./scripts/start.sh 1280x720
+          ./wstream start 1280x720
 
           # X11 探针：把收到的按键/鼠标事件按行打印，供精确断言
           gcc -O1 -Wall -Wextra -o tests/x11probe tests/x11probe.c \
@@ -91,7 +91,7 @@ jobs:
 
           python3 tests/wstest.py
 
-          ./scripts/start.sh stop
+          ./wstream stop
 
       # 生命周期测试：起停是否留垃圾、死 socket 能否恢复、孤儿能否清理。
       # 这些 bug 不会让任何功能断言变红 —— 功能全好，只是每跑一次漏一批进程。

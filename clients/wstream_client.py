@@ -60,7 +60,7 @@ class WStream:
     参数：
       host/port   wstream 监听地址（默认 127.0.0.1:8765）
       width/height 沙箱分辨率，用于坐标换算。默认 None = 首次 move/click
-                  时自动从 GET /info 探测（start.sh 默认 1600x1000，别猜）
+                  时自动从 GET /info 探测（wstream start 默认 1600x1000，别猜）
     """
 
     def __init__(self, host="127.0.0.1", port=8765, width=None, height=None,
@@ -387,7 +387,7 @@ class WStream:
     # ---------------------------------------------------------------- 组合操作
 
     def wait_ready(self, timeout=30):
-        """等 wstream 能服务（start.sh 刚返回时它可能还没初始化完）。"""
+        """等 wstream 能服务（wstream start 刚返回时它可能还没初始化完）。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:

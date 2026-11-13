@@ -54,8 +54,7 @@
 #include "wlr-virtual-pointer.h"
 #include "virtual-keyboard.h"
 #include "wlr-data-control.h"
-
-#define WSTREAM_VERSION "1.5.1"
+#include "instance.h"
 
 /* ============================================================ 基础工具 */
 
@@ -1554,7 +1553,7 @@ static int has_viewers(void) {
  * sway 的 i3-ipc 协议很简单：magic "i3-ipc" + len + type，GET_TREE=4。
  * 返回的 JSON 里每个容器带 rect 和 app_id/title。
  *
- * 这样做的前提：沙箱用的是 sway（start.sh 就是）。换成别的合成器时
+ * 这样做的前提：沙箱用的是 sway（wstream start 就是）。换成别的合成器时
  * 这个端点返回 501，不影响其它功能。 */
 #define SWAY_IPC_GET_TREE 4
 
@@ -2443,7 +2442,7 @@ static void *http_thread(void *arg) {
 static volatile sig_atomic_t g_run = 1;
 static void on_sig(int s) { (void)s; g_run = 0; }
 
-int main(int argc, char **argv) {
+static int stream_main(int argc, char **argv) {
     int port = 8765, fps = 10, opt;
     const char *ppm_out = NULL;
     while ((opt = getopt(argc, argv, "p:f:q:vs:")) != -1) {
@@ -2483,7 +2482,7 @@ int main(int argc, char **argv) {
      * Wayland 客户端，连的是环境里 WAYLAND_DISPLAY/XDG_RUNTIME_DIR 指向的合成器。
      * 直接 ./wstream 会继承真实登录会话的环境（/run/user/<uid>），于是抓屏抓的是
      * 你的真实显示器、键鼠注入也打进真实桌面 —— 正是本项目要杜绝的。默认拒绝连接
-     * 真实会话；隔离沙箱请用 ./scripts/start.sh。极少数确需直连真实桌面的场景，
+     * 真实会话；隔离沙箱请用 ./wstream start。极少数确需直连真实桌面的场景，
      * 显式 WSTREAM_ALLOW_REAL_DISPLAY=1 解锁。 */
     {
         const char *rt0 = getenv("XDG_RUNTIME_DIR");
@@ -2496,7 +2495,7 @@ int main(int argc, char **argv) {
         if (is_real && !getenv("WSTREAM_ALLOW_REAL_DISPLAY")) {
             die("拒绝连接真实桌面会话（XDG_RUNTIME_DIR=%s, WAYLAND_DISPLAY=%s）。\n"
                 "  wstream 不会自己启动 sway；直接运行会抓屏并注入到你的真实桌面。\n"
-                "  隔离沙箱请用 ./scripts/start.sh；确需直连真实桌面设 WSTREAM_ALLOW_REAL_DISPLAY=1。",
+                "  隔离沙箱请用 ./wstream start；确需直连真实桌面设 WSTREAM_ALLOW_REAL_DISPLAY=1。",
                 rt0 ? rt0 : "(未设)", wl0 ? wl0 : "(未设)");
         }
     }
@@ -2737,4 +2736,27 @@ int main(int argc, char **argv) {
     wl_display_disconnect(cap.display);
     tjDestroy(enc.tj); free(enc.buf);
     return 0;
+}
+
+/* 子命令分发：start/stop/list/stop-all/dashboard/version/help 走编排模块
+ * （instance.c）；stream（或裸 wstream + 选项）走纯推流客户端。 */
+int main(int argc, char **argv) {
+    if (argc >= 2) {
+        const char *c = argv[1];
+        if (!strcmp(c, "start") || !strcmp(c, "stop") || !strcmp(c, "list") ||
+            !strcmp(c, "stop-all") || !strcmp(c, "dashboard") ||
+            !strcmp(c, "version") || !strcmp(c, "help"))
+            return instance_main(argc - 1, argv + 1);
+        if (!strcmp(c, "stream"))
+            return stream_main(argc - 1, argv + 1);
+        if (!strcmp(c, "--version") || !strcmp(c, "-V")) {
+            printf("wstream %s\n", WSTREAM_VERSION);
+            return 0;
+        }
+        if (!strcmp(c, "--help") || !strcmp(c, "-h")) {
+            char *help_argv[] = { "help", NULL };
+            return instance_main(1, help_argv);
+        }
+    }
+    return stream_main(argc, argv);
 }

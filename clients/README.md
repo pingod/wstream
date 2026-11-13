@@ -17,7 +17,7 @@ from wstream_client import WStream
 from wstream_client import WStream
 
 with WStream() as ws:
-    ws.wait_ready()                       # start.sh 刚返回时它可能还没初始化完
+    ws.wait_ready()                       # wstream start 刚返回时它可能还没初始化完
     ws.take()                             # ⚠️ 不调这个，所有输入都会被服务端丢弃
 
     # 看有哪些窗口、各在哪
@@ -62,7 +62,7 @@ with WStream() as ws:
 | `run_in_window(cmd, app_id=)` | 点窗口 + 输入命令 + 回车 |
 
 > **分辨率自动探测**：`WStream()` 默认不写死分辨率，首次 `move/click` 时从
-> `GET /info` 探测沙箱真实尺寸（`start.sh` 默认 1600x1000，别猜）。也可显式传
+> `GET /info` 探测沙箱真实尺寸（`wstream start` 默认 1600x1000，别猜）。也可显式传
 > `WStream(width=1280, height=720)` 跳过探测。
 
 ## 三个容易踩的坑

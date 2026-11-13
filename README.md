@@ -76,7 +76,7 @@ wstream 的思路是：**给 agent 一个完全独立的虚拟桌面**。
 | **给 agent 的 API** | `GET /snapshot.jpg` 取单帧、`GET /windows` 查窗口坐标、可 import 的 Python 客户端 |
 | **纯 C** | 单文件 ~1100 行，无运行时依赖（除 3 个系统库） |
 | **低开销** | 推流进程 CPU ~0.1%，带宽 ~0.16 MB/s @10fps |
-| **零配置** | `./scripts/start.sh` 一条命令起全套 |
+| **零配置** | `./wstream start` 一条命令起全套 |
 
 ---
 
@@ -86,7 +86,7 @@ wstream 的思路是：**给 agent 一个完全独立的虚拟桌面**。
 git clone https://github.com/pingod/wstream.git
 cd wstream
 ./build.sh                 # 编译
-./scripts/start.sh         # 起沙箱 + 推流
+./wstream start           # 起沙箱 + 推流
 ```
 
 然后浏览器打开 **<http://127.0.0.1:8765>**。
@@ -97,7 +97,7 @@ cd wstream
 停止：
 
 ```bash
-./scripts/start.sh stop
+./wstream stop
 ```
 
 ---
@@ -143,12 +143,12 @@ sudo pacman -S --needed gcc pkgconf wayland wayland-protocols \
 ### 完整沙箱（推荐）
 
 ```bash
-./scripts/start.sh              # 默认 1600x1000
-./scripts/start.sh 1920x1080    # 指定分辨率
-./scripts/start.sh stop         # 停止
+./wstream start              # 默认 1600x1000
+./wstream start 1920x1080    # 指定分辨率
+./wstream stop               # 停止
 ```
 
-脚本会：
+wstream start 会：
 1. 起一个 `sway --unsupported-gpu`，`WLR_BACKENDS=headless`（无头）
 2. 在沙箱里跑两个不停刷新的终端（方便确认画面是实时的）
 3. 起 `wstream` 监听 `127.0.0.1:8765`
@@ -551,7 +551,7 @@ keymap」加了每键推送，把组合键全弄坏了 —— 而且 24 项测�
 它只给 title/app_id，**不给坐标**。要读 sway IPC `GET_TREE`。
 解析别用 strstr：JSON 里 `rect` 在 `app_id` 之前且节点嵌套，会错位。
 
-### 21. `start.sh` 里的 socket 名不能写死
+### 21. `start.sh` 里的 socket 名不能写死（现为 `wstream start` 子命令）
 
 sway 的 socket 不一定是 `wayland-0`（多实例时会是 `wayland-1`）。
 必须动态探测：
@@ -579,8 +579,8 @@ exec /path/to/desktop.sh
 每个实例 = 独立 sway + 独立 wstream + 独立端口，**完全隔离**：
 
 ```bash
-WSTREAM_ROOT=/tmp/ws-a WSTREAM_PORT=8801 ./scripts/start.sh
-WSTREAM_ROOT=/tmp/ws-b WSTREAM_PORT=8802 ./scripts/start.sh
+WSTREAM_ROOT=/tmp/ws-a WSTREAM_PORT=8801 ./wstream start
+WSTREAM_ROOT=/tmp/ws-b WSTREAM_PORT=8802 ./wstream start
 ```
 
 | 资源 | 隔离方式 |
@@ -600,13 +600,13 @@ http://127.0.0.1:8802
 
 **② 列出所有在跑的实例**
 ```bash
-./scripts/list.sh          # 表格：端口 / 状态 / 运行时目录 / URL
-./scripts/list.sh --url    # 只输出 URL，方便脚本消费
+./wstream list          # 表格：端口 / 状态 / 运行时目录 / URL
+./wstream list --url    # 只输出 URL，方便脚本消费
 ```
 
 **③ 总览页：一屏看全部画面**
 ```bash
-./scripts/dashboard.sh     # 生成 /tmp/wstream-dashboard.html
+./wstream dashboard     # 生成 /tmp/wstream-dashboard.html
 ```
 所有实例的实时 MJPEG 并排成网格。点每张卡片的「打开 ↗」进入可交互页面。
 
@@ -618,7 +618,7 @@ http://127.0.0.1:8802
 
 **停某一个**（必须带 `WSTREAM_ROOT`）：
 ```bash
-WSTREAM_ROOT=/tmp/ws-a ./scripts/start.sh stop
+WSTREAM_ROOT=/tmp/ws-a ./wstream stop
 ```
 
 > ⚠️ 不带 `WSTREAM_ROOT` 会按默认 `/tmp/wstream` 处理，
@@ -626,12 +626,12 @@ WSTREAM_ROOT=/tmp/ws-a ./scripts/start.sh stop
 
 **全停**（收工 / 清理所有 agent 的实例）：
 ```bash
-./scripts/stop-all.sh             # 列出要停的实例，确认后执行
-./scripts/stop-all.sh --yes       # 不确认（CI / 脚本用）
-./scripts/stop-all.sh --dry-run   # 只列不停
+./wstream stop-all             # 列出要停的实例，确认后执行
+./wstream stop-all --yes       # 不确认（CI / 脚本用）
+./wstream stop-all --dry-run   # 只列不停
 ```
 
-`stop-all.sh` 的安全设计：只按 **XDG_RUNTIME_DIR 归属**判断，绝不按进程名裸杀
+`wstream stop-all` 的安全设计：只按 **XDG_RUNTIME_DIR 归属**判断，绝不按进程名裸杀
 （`sway` 这个名字你桌面也在用）。它会连 `desktop.sh` 和沙箱里的窗口程序一起清掉 ——
 这些以前会残留，每跑一轮漏一批。
 

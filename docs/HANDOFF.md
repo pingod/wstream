@@ -178,7 +178,7 @@ DNS rebinding 的路子。
 **回归测试**（改完必跑，注意 `/tmp` 在部分环境每次调用会重置，需在同一条命令里跑）：
 
 ```bash
-./scripts/start.sh 1280x720
+./wstream start 1280x720
 # 期望 403
 curl -si -H "Host: 127.0.0.1:8765" -H "Origin: http://evil.example"      -H "Upgrade: websocket" -H "Connection: Upgrade"      -H "Sec-WebSocket-Key: YWJjZGVmZ2gxMjM0NTY3OA=="      -H "Sec-WebSocket-Version: 13" http://127.0.0.1:8765/ws | head -1
 # 期望 101
@@ -343,11 +343,13 @@ belongs_to_root() {   # 见 scripts/start.sh
 
 `stop_all` 里本来就是这个写法（是对的），只有 `start` 那段漏了。
 
+>（实例编排现已内置为 `wstream start`/`stop` 子命令，归属判据不变。）
+
 ### 坑 22：`stop` 必须带 `WSTREAM_ROOT`
 
 ```bash
-WSTREAM_ROOT=/tmp/ws-a ./scripts/start.sh stop   # ✅ 停 A
-./scripts/start.sh stop                          # ❌ 按默认 /tmp/wstream 处理
+WSTREAM_ROOT=/tmp/ws-a ./wstream stop   # ✅ 停 A
+./wstream stop                          # ❌ 按默认 /tmp/wstream 处理
 ```
 
 不带的话停的是默认实例，或者什么都没停 —— 而且**看起来是成功的**（打印「已停止」）。
@@ -439,7 +441,7 @@ socket 文件是 sway 退出后残留的普通文件。sway 崩了 / 被 OOM 杀
 
 ### 坑 27：实例目录被删后，孤儿进程永远清不掉
 
-`stop-all.sh` 最初的归属判据要求 `$root` 目录**存在**且有 pid 文件。
+`stop-all.sh`（现为 `wstream stop-all` 子命令）最初的归属判据要求 `$root` 目录**存在**且有 pid 文件。
 但如果实例目录被 `rm -rf` 了（我的测试脚本就这么干过），它的 `desktop.sh`
 还在跑，却因为「目录没了」永远匹配不上任何实例 —— 清不掉。
 
@@ -534,9 +536,9 @@ subprocess.Popen(["setsid", "./tests/x11probe"], ...,
 
 wstream 二进制**不启动任何合成器**，它只是个 Wayland 客户端，`wl_display_connect(NULL)`
 连的是环境里 `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` 指向的合成器。起隔离 sway 的是
-`start.sh`，不是 wstream。直接 `./wstream` 会继承你真实登录会话的环境
+`wstream start`，不是裸 `wstream`。直接 `./wstream` 会继承你真实登录会话的环境
 （`XDG_RUNTIME_DIR=/run/user/<uid>`），于是抓的是真实显示器、注入也打进真实桌面
-—— 隔离红线被破。修法：连接前检测真实会话目录，默认拒绝并提示用 start.sh；
+—— 隔离红线被破。修法：连接前检测真实会话目录，默认拒绝并提示用 `wstream start`；
 确需直连真实桌面显式 `WSTREAM_ALLOW_REAL_DISPLAY=1`。**「能连上」不等于「连对了」。**
 
 ---
@@ -576,9 +578,9 @@ wstream 二进制**不启动任何合成器**，它只是个 Wayland 客户端�
 ./build.sh
 gcc -O1 -Wall -Wextra -o tests/x11probe tests/x11probe.c \
     $(pkg-config --cflags --libs x11)
-./scripts/start.sh 1280x720
+./wstream start 1280x720
 python3 tests/wstest.py          # 退出码 0 = 全过
-./scripts/start.sh stop
+./wstream stop
 # 细节见 tests/README.md。注意两个坑：SWAYSOCK 要设；新窗口会让 sway 重排。
 
 # 1. 编译（必须零警告）
@@ -586,7 +588,7 @@ python3 tests/wstest.py          # 退出码 0 = 全过
 ./build.sh 2>&1 | grep -i warning && echo "有警告！" || echo "干净"
 
 # 2. 起沙箱
-./scripts/start.sh 1280x720
+./wstream start 1280x720
 
 # 3. 首页可达
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8765/
@@ -601,7 +603,7 @@ ffmpeg -i /tmp/shot.ppm /tmp/shot.png && echo "看图确认有内容"
 #    或直接用浏览器打开 http://127.0.0.1:8765 点画面打字
 
 # 6. 停
-./scripts/start.sh stop
+./wstream stop
 ```
 
 ### 调试神器
@@ -670,7 +672,7 @@ cd ~/githome/wstream
 git log --oneline          # 看历史
 cat CHANGELOG.md           # 看修过什么
 ./build.sh                 # 确认能编译
-./scripts/start.sh         # 确认能跑
+./wstream start         # 确认能跑
 # 浏览器打开 http://127.0.0.1:8765，点画面，打字试试
 ```
 

@@ -10,8 +10,8 @@
 `pgrep -a wstream` 会列出**所有**实例，`/tmp/wstream` 也不一定是你要查的那个。
 
 ```bash
-./scripts/list.sh          # 最省事：列出所有实例的端口 / 状态 / 目录
-./scripts/list.sh --url    # 只要 URL
+./wstream list          # 最省事：列出所有实例的端口 / 状态 / 目录
+./wstream list --url    # 只要 URL
 ```
 
 定位到某个实例之后，再带着它跑诊断命令：
@@ -24,7 +24,7 @@ export XDG_RUNTIME_DIR="$WSTREAM_ROOT/run" WAYLAND_DISPLAY="$WL"
 
 > ⚠️ 文档里的 `pgrep -a wstream` / `pgrep -a sway` 这类命令是**全局**的。
 > 只读查看没问题；**要杀进程时绝不能用它们** —— 会把别的实例和你的桌面一起杀掉。
-> 收工用 `./scripts/stop-all.sh`（它会按实例归属判断，不碰用户桌面）。
+> 收工用 `./wstream stop-all`（它会按实例归属判断，不碰用户桌面）。
 
 ---
 

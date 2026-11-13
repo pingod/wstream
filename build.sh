@@ -24,7 +24,7 @@ gen "$PROTO/wlr-data-control-unstable-v1.xml"    wlr-data-control
 # virtual-keyboard 的 XML 不在任何发行包里，随源码带一份
 gen protocols/virtual-keyboard-unstable-v1.xml   virtual-keyboard
 
-gcc -O2 -g -Wall -Wextra -o wstream src/wstream.c \
+gcc -O2 -g -Wall -Wextra -o wstream src/wstream.c src/instance.c \
     proto/wlr-screencopy.c proto/wlr-virtual-pointer.c proto/virtual-keyboard.c \
     proto/wlr-data-control.c \
     -Iproto $(pkg-config --cflags --libs wayland-client libturbojpeg xkbcommon) -lpthread

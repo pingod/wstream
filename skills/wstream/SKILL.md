@@ -38,7 +38,7 @@ metadata:
 ```bash
 cd ~/githome/wstream          # 或任何 clone 下来的位置
 ./build.sh                    # 首次需要编译
-./scripts/start.sh            # 默认 1600x1000，端口 8765
+./wstream start              # 默认 1600x1000，端口 8765
 ```
 
 然后告诉用户：**浏览器打开 <http://127.0.0.1:8765>，点一下画面就能接管**。
@@ -46,7 +46,7 @@ cd ~/githome/wstream          # 或任何 clone 下来的位置
 停止：
 
 ```bash
-./scripts/start.sh stop
+./wstream stop
 ```
 
 ### 首次安装依赖（Arch / CachyOS）
@@ -71,7 +71,7 @@ import sys; sys.path.insert(0, "/path/to/wstream/clients")
 from wstream_client import WStream
 
 with WStream() as ws:
-    ws.wait_ready()                       # start.sh 刚返回时可能还没初始化完
+    ws.wait_ready()                       # wstream start 刚返回时可能还没初始化完
     ws.take()                             # ⚠️ 不调这个，所有输入都会被丢弃
 
     for w in ws.windows():                # 知道该点哪里
@@ -86,7 +86,7 @@ with WStream() as ws:
 ```
 
 > 分辨率自动探测：`WStream()` 默认从 `GET /info` 探测沙箱真实尺寸再换算坐标，
-> 不用手填 width/height（start.sh 默认 1600x1000）。`ws.output_size()` 可查。
+> 不用手填 width/height（wstream start 默认 1600x1000）。`ws.output_size()` 可查。
 
 API 速查见 `clients/README.md`。下面两种方式是它的底层实现，
 需要精细控制时再看。
@@ -257,8 +257,8 @@ timeout 2 wl-paste          # 读
 多个 agent 同时要 GUI 时，各起一个实例，互不干扰：
 
 ```bash
-WSTREAM_ROOT=/tmp/ws-agent1 WSTREAM_PORT=8801 ./scripts/start.sh
-WSTREAM_ROOT=/tmp/ws-agent2 WSTREAM_PORT=8802 ./scripts/start.sh
+WSTREAM_ROOT=/tmp/ws-agent1 WSTREAM_PORT=8801 ./wstream start
+WSTREAM_ROOT=/tmp/ws-agent2 WSTREAM_PORT=8802 ./wstream start
 ```
 
 然后各用各的端口：
@@ -271,18 +271,18 @@ with WStream(port=8801) as ws:   # agent 1
 查看有哪些实例在跑：
 
 ```bash
-./scripts/list.sh        # 表格
-./scripts/list.sh --url  # 只要 URL
+./wstream list        # 表格
+./wstream list --url  # 只要 URL
 ```
 
 **注意**：`stop` 必须带 `WSTREAM_ROOT`，否则停的是默认实例：
 ```bash
-WSTREAM_ROOT=/tmp/ws-agent1 ./scripts/start.sh stop
+WSTREAM_ROOT=/tmp/ws-agent1 ./wstream stop
 ```
 
 收工时一次全停（不用记有哪些实例）：
 ```bash
-./scripts/stop-all.sh --yes
+./wstream stop-all --yes
 ```
 
 ### 方式 B：在沙箱里直接跑命令（更简单）
@@ -362,7 +362,7 @@ hyprctl cursorpos
 | 握手回 403 | `Host`/`Origin` 不是本机来源 | 用 `Host: 127.0.0.1:8765`，别带外站 `Origin`，见坑 6 |
 | 服务随机崩 / 越界 | `clients[]` 跨 poll 用下标 | 见 `docs/HANDOFF.md` 坑 7 |
 | 窗口跑到用户桌面上 | 没 `env -u DISPLAY` | 见 `docs/HANDOFF.md` 坑 5 |
-| `sway: Operation not permitted` | 容器缺 `CAP_SYS_NICE` | `start.sh` 已自动绕过；或 `--cap-add SYS_NICE` |
+| `sway: Operation not permitted` | 容器缺 `CAP_SYS_NICE` | `wstream start` 已自动绕过；或 `--cap-add SYS_NICE` |
 
 详细版：`docs/TROUBLESHOOTING.md`
 
@@ -387,7 +387,7 @@ hyprctl cursorpos
 1. **绝不把沙箱内容弄到用户真实桌面上** —— 窗口、输入、焦点都不行。
    这是这个项目存在的全部意义，破了就没价值。
    ⚠️ 裸 `./wstream` 不启动合成器，会连真实桌面抓屏/注入；1.5.1 起默认拒绝连接
-   `/run/user/<uid>`，必须用 `./scripts/start.sh` 起沙箱（确需直连真实桌面设
+   `/run/user/<uid>`，必须用 `./wstream start` 起沙箱（确需直连真实桌面设
    `WSTREAM_ALLOW_REAL_DISPLAY=1`）。
 2. **不要用 `pkill -f <关键字>`** —— bash 自己的命令行也含该字符串，会杀掉自己。
    用 `pgrep -x`（精确匹配进程名）。

@@ -26,9 +26,8 @@ import sys
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-START = os.path.join(REPO, "scripts", "start.sh")
-STOP_ALL = os.path.join(REPO, "scripts", "stop-all.sh")
-SANDBOX_APPS = ["wstream", "sway-nocap", "sway", "desktop.sh", "alacritty"]
+BIN = os.path.join(REPO, "wstream")
+SANDBOX_APPS = ["wstream", "sway-nocap", "sway", "desktop.sh", "alacritty", "sh", "sleep"]
 
 PASSES = []
 FAILS = []
@@ -66,13 +65,13 @@ def pids_of(root):
 
 def run_start(root, port, size="1024x600", timeout=120):
     env = dict(os.environ, WSTREAM_ROOT=root, WSTREAM_PORT=str(port))
-    return subprocess.run([START, size], env=env, capture_output=True,
+    return subprocess.run([BIN, "start", size], env=env, capture_output=True,
                           text=True, timeout=timeout)
 
 
 def run_stop(root, timeout=60):
     env = dict(os.environ, WSTREAM_ROOT=root)
-    return subprocess.run([START, "stop"], env=env, capture_output=True,
+    return subprocess.run([BIN, "stop"], env=env, capture_output=True,
                           text=True, timeout=timeout)
 
 
@@ -151,15 +150,15 @@ def main():
 
     finally:
         # ---------- 4. stop-all 必须能清理（坑 27）----------
-        print("── 4. stop-all.sh 能清掉本测试的实例 ──")
+        print("── 4. stop-all 能清掉本测试的实例 ──")
         env = dict(os.environ, WSTREAM_ROOT=root)
-        subprocess.run([START, "1024x600"], env=env, capture_output=True, timeout=120)
+        subprocess.run([BIN, "start", "1024x600"], env=env, capture_output=True, timeout=120)
         before = pids_of(root)
         check("stop-all 前有进程", len(before) > 0, f"(实际={before})")
 
         # 故意删掉实例目录，模拟「目录没了但进程还在」——坑 27
         shutil.rmtree(root, ignore_errors=True)
-        r = subprocess.run([STOP_ALL, "--yes"], capture_output=True, text=True,
+        r = subprocess.run([BIN, "stop-all", "--yes"], capture_output=True, text=True,
                            timeout=120)
         check("stop-all 成功返回", r.returncode == 0, r.stderr[-300:])
         time.sleep(2)

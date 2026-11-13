@@ -14,11 +14,11 @@ wstream 有一堆「踩过就几小时」的坑（见 `docs/HANDOFF.md` 第 3 �
 
 ```bash
 ./build.sh
-./scripts/start.sh 1280x720
+./wstream start 1280x720
 gcc -O1 -o tests/x11probe tests/x11probe.c $(pkg-config --cflags --libs x11)
 python3 tests/wstest.py
 python3 tests/lifecycle.py
-./scripts/start.sh stop
+./wstream stop
 ```
 
 退出码 0 = 全通过。
@@ -48,7 +48,7 @@ python3 tests/lifecycle.py
 | 文件 | 测什么 | 什么时候跑 |
 |---|---|---|
 | `tests/wstest.py` | **功能**：注入、来源校验、剪贴板、所有权、协议健壮性、隔离护栏、跑完不留垃圾（41 项） | 改了 src/wstream.c、前端 |
-| `tests/lifecycle.py` | **生命周期**：起停是否留垃圾、死 socket、孤儿清理（15 项） | 改了 scripts/ |
+| `tests/lifecycle.py` | **生命周期**：起停是否留垃圾、死 socket、孤儿清理（15 项） | 改了 `wstream start`/`stop` 生命周期逻辑 |
 
 功能正常但每跑一次漏一批进程，这种 bug 不会让任何功能断言变红，只能靠
 `lifecycle.py` 抓。它只操作 `/tmp/wstream-lc-test`，不碰你的默认实例。
