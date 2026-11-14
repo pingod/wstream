@@ -3323,13 +3323,39 @@ static int stream_main(int argc, char **argv) {
             }
             if (!g_run) break;
         }
-        /* 发起抓帧 */
+        /* 发起抓帧。
+         *
+         * ⚠️ 用 copy 而**不是** copy_with_damage（2026-11 修）。
+         *
+         * 协议原文（wlr-screencopy-unstable-v1.xml）：
+         *   copy            → "If the frame is successfully copied, flags and
+         *                      ready events are sent. Otherwise, failed."
+         *   copy_with_damage→ "Same as copy, except it **waits until there is
+         *                      damage** to copy."
+         *
+         * 也就是说 copy_with_damage 在**画面静止时不回任何事件**（既没有
+         * ready 也没有 failed），请求会一直挂着。原来的循环在这种情况下
+         * 只是 poll 超时后 dispatch_pending + flush 再等一轮 —— 从不重新发
+         * 请求，于是永久卡死：
+         *   · 主线程停在等待循环里，snap_publish() 永远不被调用
+         *   · /snapshot.jpg 等 3 秒后只能回 503 no frame yet
+         *   · /stream.mjpg 订阅者也一帧都收不到
+         * 实测（2026-11-14）：任何**静止**的窗口都会触发，与具体应用无关
+         * （kitty 静置 20 秒后同样 503）；`wstream -s` 单帧模式每次都成功，
+         * 因为它是新进程、第一帧必然是完整的一帧。
+         *
+         * 为什么不是「超时后重发 copy_with_damage」：那仍然要等 damage，
+         * 静止时重发多少次都是空转；而我们要的正是「静止时也能出帧」。
+         * 抓帧本身就是 10fps 的轮询，用 copy 每帧都拿一次完整画面，
+         * 语义更直白，代价可忽略（shm 拷贝 1600x1000 约 6MB，实测整帧
+         * 编码 + 拷贝约 10ms，远低于 100ms 的帧间隔）。
+         */
         struct zwlr_screencopy_frame_v1 *fr =
             zwlr_screencopy_manager_v1_capture_output(cap.mgr, 1, cap.output);
         cap.frame_ready = 0;
         cap.frame_failed = 0;
         zwlr_screencopy_frame_v1_add_listener(fr, &frame_listener, &cap);
-        zwlr_screencopy_frame_v1_copy_with_damage(fr, fb[cur].wl_buf);
+        zwlr_screencopy_frame_v1_copy(fr, fb[cur].wl_buf);
 
         /* 只等这一帧，别的什么都不做（HTTP 在独立线程里）。
          *
@@ -3338,7 +3364,24 @@ static int stream_main(int argc, char **argv) {
          * 第二条 frame.ready（实测：只有第一帧）。roundtrip 会主动 flush 并等
          * 一次 sync 回应，天然保证请求被推出、事件被处理。 */
         wl_display_flush(cap.display);
+
+        /* 等这一帧的**硬上限**。
+         *
+         * copy 理论上总会回 ready 或 failed，但「协议上会回」不等于「一定会回」：
+         * 合成器崩了、socket 半死、或者输出被拔掉，都可能让 ready 永不到来。
+         * 没有上限的话主线程就永久卡在这里 —— 正是 0.10.2 那个
+         * copy_with_damage 卡死问题的形态（HTTP 线程还在，界面却再也不更新）。
+         * 所以这里显式给一个期限：超过就放弃本帧、进入下一轮重发请求。
+         * 取 2 秒：远大于正常一帧（实测整帧约 10ms），又不至于让「卡住」
+         * 表现成永久无响应。 */
+        uint32_t frame_deadline = now_ms() + 2000;
+        int frame_timed_out = 0;
+
         while (g_run && !cap.frame_ready) {
+            if ((int32_t)(now_ms() - frame_deadline) >= 0) {
+                frame_timed_out = 1;
+                break;
+            }
             struct pollfd p = { .fd = wl_display_get_fd(cap.display), .events = POLLIN };
             int pr = poll(&p, 1, 100);
             if (pr < 0) {
@@ -3401,7 +3444,22 @@ static int stream_main(int argc, char **argv) {
         zwlr_screencopy_frame_v1_destroy(fr);
         if (!g_run) break;
 
-        if (cap.frame_failed) {
+        if (frame_timed_out) {
+            /* 超时：这一帧没有可用内容（buffer 里是上一帧的残留，不能当新帧用）。
+             * 计入丢帧并**立刻唤醒等待快照的请求**——否则 HTTP 线程会白等满
+             * 自己的 3 秒超时，表现为「点了截图要等 3 秒才回 503」。
+             * 下一轮循环会重新发起 copy，所以这里不是终止条件。 */
+            dropped++;
+            /* 关于缓冲复用：循环末尾 cur ^= 1 会换到另一个 buffer，所以这一轮
+             * 被放弃的 fb[cur] 即使合成器事后才写回，也只写进「下一轮不读」的
+             * 那块内存，不会撕裂画面。连续两次超时才会转回同一块 —— 那意味着
+             * 合成器基本已经不响应，此时任何方案都无意义。 */
+            pthread_mutex_lock(&g_snap_mu);
+            int waiting = g_snap_want;
+            pthread_mutex_unlock(&g_snap_mu);
+            if (waiting) snap_publish(NULL, 0);
+            if (g_verbose) logf_("抓帧超时，重发请求（累计丢弃 %ld）", dropped);
+        } else if (cap.frame_failed) {
             dropped++;
         } else {
             /* g_snap_want 由网络线程在锁里改，这里也要持锁读（裸读是数据竞争） */

@@ -1060,6 +1060,47 @@ def main():
         check("终端粘贴用 Shift 修饰", bool(re.search(r"function sendPaste\(term\)\{[^}]*send\(4,42,1\)", js)),
               "(sendPaste 里没发 Shift)")
 
+        # 9j4. 静止画面也必须能出帧（2026-11 修 copy_with_damage 卡死）。
+        #
+        # 原来用 zwlr_screencopy_frame_v1.copy_with_damage 抓帧，而协议原文是
+        #   "Same as copy, except it **waits until there is damage** to copy."
+        # 于是画面静止时合成器**不回任何事件**（既没有 ready 也没有 failed），
+        # 请求一直挂着；主循环在 poll 超时后只 dispatch_pending + flush，
+        # 从不重新发请求 → 永久卡死：
+        #   · /snapshot.jpg 等满 3 秒回 503 no frame yet
+        #   · /stream.mjpg 订阅者一帧都收不到
+        # 现象与具体应用无关：任何静止窗口都会触发（kitty 静置 20 秒同样 503），
+        # 而 `wstream -s` 每次都能成功 —— 因为它是新进程，第一帧必然完整。
+        #
+        # 断言方式：**先让画面彻底静止**（不注入任何输入），再连抓两张快照，
+        # 都必须 200 且有内容。修复前这里稳定失败。
+        try:
+            import urllib.request
+            import urllib.error
+
+            def snap_once(timeout=6):
+                try:
+                    with urllib.request.urlopen(
+                            f"http://{HOST}:{PORT}/snapshot.jpg", timeout=timeout) as r:
+                        return r.status, len(r.read())
+                except urllib.error.HTTPError as e:
+                    return e.code, 0
+                except Exception as e:
+                    return type(e).__name__, 0
+
+            # 静置：不做任何注入，等两帧周期以上，确保没有 pending damage
+            time.sleep(1.5)
+            st1, n1 = snap_once()
+            time.sleep(0.5)
+            st2, n2 = snap_once()
+            check("静止画面能出快照（第一张）", st1 == 200 and n1 > 1000,
+                  f"(st={st1} size={n1})")
+            check("静止画面能出快照（第二张）", st2 == 200 and n2 > 1000,
+                  f"(st={st2} size={n2})")
+        except Exception as e:
+            check("静止画面能出快照（第一张）", False, f"(异常={e})")
+            check("静止画面能出快照（第二张）", False, f"(异常={e})")
+
         # 9k. 隔离护栏：裸 wstream 指向真实登录会话必须拒绝（绝不能抓真实桌面）。
         #     两条都在 wl_display_connect 之前 die，不会真连桌面，安全。
         real_rt = f"/run/user/{os.getuid()}"
