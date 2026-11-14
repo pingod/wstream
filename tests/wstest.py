@@ -1101,6 +1101,34 @@ def main():
             check("静止画面能出快照（第一张）", False, f"(异常={e})")
             check("静止画面能出快照（第二张）", False, f"(异常={e})")
 
+        # 9l. PATH 超长时仍能找到 sway（2026-11 修的真 bug）。
+        #
+        # find_in_path 原来用 `char buf[512]` 拷 PATH，超过 511 字节就**静默截断**，
+        # 后面的目录全部看不见。实测触发链：调用方反复 source 一个每次都
+        # `export PATH=新目录:$PATH` 的环境脚本 → PATH 累积到 1126 字节 →
+        # /usr/bin 落在截断点之后 → `wstream start` 报「找不到 sway，
+        # 先装 pacman -S sway」，而 sway 明明就在 /usr/bin 下。
+        # 这种错报极难定位：错误信息把人引向「没装包」，实际是查找逻辑截断。
+        #
+        # 断言方式：构造一个 >512 字节、且把 /usr/bin 放在末尾的 PATH，
+        # 要求 start 仍然成功（能定位到 sway）。
+        try:
+            wbin_l = os.path.join(REPO, "wstream")
+            pad = ":".join(["/nonexistent_pad_%03d" % i for i in range(40)])
+            long_path = "/usr/local/bin:" + pad + ":/usr/bin:/bin"
+            long_env = dict(os.environ, PATH=long_path)
+            rl = subprocess.run([wbin_l, "start", "1280x720"],
+                                env=long_env, capture_output=True, text=True, timeout=90)
+            ok = rl.returncode == 0 and "找不到 sway" not in (rl.stdout + rl.stderr)
+            check("PATH 超过 512 字节仍能找到 sway", ok and len(long_path) > 512,
+                  f"(PATH {len(long_path)} 字节, rc={rl.returncode}, "
+                  f"err={(rl.stderr or rl.stdout)[-100:]})")
+            if ok:
+                subprocess.run([wbin_l, "stop", "--yes"], env=long_env,
+                               capture_output=True, text=True, timeout=60)
+        except Exception as e:
+            check("PATH 超过 512 字节仍能找到 sway", False, f"(异常={e})")
+
         # 9k. 隔离护栏：裸 wstream 指向真实登录会话必须拒绝（绝不能抓真实桌面）。
         #     两条都在 wl_display_connect 之前 die，不会真连桌面，安全。
         real_rt = f"/run/user/{os.getuid()}"

@@ -338,18 +338,45 @@ static int have_prog(const char *name) {
     return 0;
 }
 
+/* 在 PATH 里找可执行文件。
+ *
+ * ⚠️ 不能用固定 512 字节的缓冲去拷 PATH（2026-11 修的真 bug）。
+ *   原来写的是 `char buf[512]; snprintf(buf, sizeof buf, "%s", path);` ——
+ *   PATH 一旦超过 511 字节就被**静默截断**，后面的目录全部看不见。
+ *   实测踩到：调用方反复 source 一个每次都 `export PATH=新目录:$PATH` 的
+ *   环境脚本，PATH 累积到 1126 字节，/usr/bin 落在 512 之后，于是
+ *   `find_in_path("sway")` 返回失败，报「找不到 sway，先装：pacman -S sway」
+ *   —— 而 sway 明明就装在 /usr/bin 下。这种错报极难定位：错误信息把人
+ *   引向「没装包」，实际是查找逻辑截断。
+ *
+ *   现在改为按需分配，长度只受 PATH 本身限制。 */
 static int find_in_path(const char *name, char *out, size_t cap) {
-    char *path = getenv("PATH");
-    if (!path) return -1;
-    char buf[512];
-    snprintf(buf, sizeof buf, "%s", path);
+    const char *path = getenv("PATH");
+    if (!path || !*path) return -1;
+
+    size_t plen = strlen(path);
+    char *buf = malloc(plen + 1);
+    if (!buf) return -1;
+    memcpy(buf, path, plen + 1);
+
+    int rc = -1;
     char *save = NULL;
     for (char *tok = strtok_r(buf, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
-        char full[512];
-        snprintf(full, sizeof full, "%s/%s", tok, name);
-        if (access(full, X_OK) == 0) { snprintf(out, cap, "%s", full); return 0; }
+        if (!*tok) continue;                     /* 连续的冒号 = 当前目录，跳过 */
+        size_t need = strlen(tok) + 1 + strlen(name) + 1;
+        char *full = malloc(need);
+        if (!full) continue;
+        snprintf(full, need, "%s/%s", tok, name);
+        if (access(full, X_OK) == 0) {
+            snprintf(out, cap, "%s", full);
+            rc = 0;
+            free(full);
+            break;
+        }
+        free(full);
     }
-    return -1;
+    free(buf);
+    return rc;
 }
 
 /* 带沙箱环境跑 wlr-randr，捕获 stdout（out 非空时），返回退出码。
