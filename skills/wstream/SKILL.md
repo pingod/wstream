@@ -40,7 +40,7 @@ cd ~/githome/wstream          # 或任何 clone 下来的位置
 ./build.sh                    # 首次需要编译
 ./wstream version            # 当前版本（如 0.3）
 ./wstream start              # 默认 1600x1000，端口 8765
-./wstream start --app <程序>   # 可选：沙箱打开指定程序（默认开命令行+毫秒时钟两窗口）
+./wstream start --app <程序>   # 可选：启动即打开指定程序（默认空桌面，窗口由页面按钮开）
 ```
 
 然后告诉用户：**浏览器打开 <http://127.0.0.1:8765>，点一下画面就能接管**。
@@ -76,6 +76,7 @@ with WStream() as ws:
     ws.wait_ready()                       # wstream start 刚返回时可能还没初始化完
     ws.take()                             # ⚠️ 不调这个，所有输入都会被丢弃
 
+    ws.open_window(1)                     # 沙箱默认空桌面：开命令行（= 页面「命令行」按钮）
     for w in ws.windows():                # 知道该点哪里
         print(w["app_id"], (w["cx"], w["cy"]))
 
@@ -377,7 +378,7 @@ hyprctl cursorpos
 
 | 症状 | 最可能原因 | 动作 |
 |---|---|---|
-| 浏览器一片黑 | 沙箱里没窗口 | `grim` 截图确认；检查 `desktop.sh` 是否执行 |
+| 浏览器一片黑 | 沙箱里没窗口 | 默认沙箱就是空桌面，点页面「命令行」按钮（或 `ws.open_window(1)`） |
 | 只有第一帧 | poll 超时没 dispatch_pending | 看 `src/wstream.c` 主循环 |
 | 鼠标完全不动 | ① `cap.ptr` 为 NULL ② 合成器不支持 `motion_absolute` | `WAYLAND_DEBUG=client ./wstream \| grep motion`；换 sway |
 | 只有左半边能点 | 坐标按 int16 读了 | 见 `docs/HANDOFF.md` 坑 3 |

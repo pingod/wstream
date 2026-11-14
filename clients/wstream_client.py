@@ -31,6 +31,7 @@ __all__ = ["WStream", "WStreamError"]
 
 # 上行 type（与 src/wstream.c 的 handle_msg 对应）
 T_MOVE, T_BUTTON, T_SCROLL, T_KEY, T_TEXT, T_CTRL, T_CLIP_SET, T_CLIP_GET = 1, 2, 3, 4, 5, 6, 7, 8
+T_WINDOW = 12   # 按需打开预设窗口（A = 预设编号）
 # 下行 type
 D_CLIPBOARD = 0x81
 
@@ -255,6 +256,31 @@ class WStream:
             time.sleep(0.05)
             self._cmd(T_BUTTON, button, 0)
             time.sleep(0.08)
+
+    # ---------------------------------------------------------------- 窗口
+
+    PRESETS = {1: "AgentTop", 2: "AgentSub"}
+
+    def open_window(self, preset=1, wait=True, timeout=20):
+        """在沙箱里按需打开预设窗口（沙箱启动后默认是空桌面）。
+
+        preset: 1 = 交互命令行（app_id AgentTop），2 = 毫秒时钟（AgentSub）。
+        wait=True 时等到窗口真的出现在 /windows 里再返回。已有同名窗口不会重复开。
+
+        等价于页面上那两个按钮（WS type 12）；不需要 take()。
+        """
+        if preset not in self.PRESETS:
+            raise WStreamError(f"未知窗口预设 {preset}（可选 {sorted(self.PRESETS)}）")
+        self._cmd(T_WINDOW, preset, 0)
+        if not wait:
+            return True
+        app_id = self.PRESETS[preset]
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.window(app_id=app_id):
+                return True
+            time.sleep(0.3)
+        return False
 
     def click_window(self, app_id=None, title_contains=None, button=1):
         """点某个窗口的中心。找不到窗口返回 False。"""

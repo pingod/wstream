@@ -419,7 +419,15 @@ static pid_t spawn_sway(const char *root, const char *sway_bin) {
         setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
         setenv("__EGL_VENDOR_LIBRARY_FILENAMES",
                "/usr/share/glvnd/egl_vendor.d/50_mesa.json", 1);
-        execlp(sway_bin, "sway", "--unsupported-gpu", (char *)NULL);
+        /* ⚠️ 必须把配置路径放进 cmdline：instance_root_of() 判定「这个进程属于哪个
+         * 实例」靠两条证据 —— root 下的 .pid 文件，或 cmdline 里出现 "<root>/"。
+         * 默认实例不再写 desktop.sh（窗口改由浏览器按钮按需拉起）之后，sway 的
+         * cmdline 里就一个 root 路径都没有了；目录一旦被删（测试会这么干），
+         * stop-all 就再也认不出它，留下孤儿 sway-nocap。显式 -c 补上这条证据。 */
+        char cfgpath[1024];
+        int cn = snprintf(cfgpath, sizeof cfgpath, "%s/sway/config", cfgdir);
+        if (cn < 0 || (size_t)cn >= sizeof cfgpath) _exit(127);
+        execlp(sway_bin, "sway", "--unsupported-gpu", "-c", cfgpath, (char *)NULL);
         _exit(127);
     }
     return pid;
@@ -483,29 +491,21 @@ static int copy_file(const char *src, const char *dst) {
 
 /* ---------------------------------------------------------------- 沙箱内容 */
 
-/* 生成 desktop.sh：窗口1 固定为交互命令行；窗口2 默认是毫秒时钟，--app 指定时
- * 改为直接启动该程序（原生窗口，GUI 程序可用）。stop 按 XDG_RUNTIME_DIR 归属
- * 清理，故任意程序名都能收掉。 */
+/* 生成 desktop.sh：**只在 --app 时写**。
+ *
+ * 默认沙箱启动后是**空的** —— 交互命令行和毫秒时钟不再自动拉起，改由浏览器里
+ * 的两个按钮（WS type 12）按需打开。理由：自动开窗口的沙箱没法「先看看干净
+ * 桌面」，而关掉它们只能停实例重建。--app 是用户显式要求，仍然自动启动。
+ *
+ * stop 按 XDG_RUNTIME_DIR 归属清理，故任意程序名都能收掉。 */
 static int write_desktop_sh(const char *root, const char *app) {
     char path[512];
     snprintf(path, sizeof path, "%s/desktop.sh", root);
     char buf[4096];
-    int n;
-    if (app && *app) {
-        n = snprintf(buf, sizeof buf,
-            "#!/bin/sh\n"
-            "alacritty --class AgentTop -e sh -i &\n"
-            "sleep 1\n"
-            "%s &\n"
-            "sleep 36000\n", app);
-    } else {
-        n = snprintf(buf, sizeof buf,
-            "#!/bin/sh\n"
-            "alacritty --class AgentTop -e sh -i &\n"
-            "sleep 1\n"
-            "alacritty --class AgentSub -e sh -c 'while :; do printf \"窗口 2  %%s.%%s\\n\" \"$(date +%%H:%%M:%%S)\" \"$(date +%%N | cut -c1-3)\"; sleep 0.05; done' &\n"
-            "sleep 36000\n");
-    }
+    int n = snprintf(buf, sizeof buf,
+        "#!/bin/sh\n"
+        "%s &\n"
+        "sleep 36000\n", app);
     if (n < 0 || (size_t)n >= sizeof buf) return -1;
     return write_file(path, buf, (size_t)n, 0755);
 }
@@ -540,12 +540,21 @@ static int start_instance(const char *root, int port, const char *size, const ch
         snprintf(dir, sizeof dir, "%s/run", root); chmod(dir, 0700);
 
         char path[512];
-        if (write_desktop_sh(root, app) < 0) idie("写入 desktop.sh 失败");
+        /* 默认沙箱不写 desktop.sh：起完就是空桌面，窗口由浏览器按钮按需拉起。
+         * 只有 --app 才写（用户显式要求开机就启动那个程序）。 */
+        if (app && *app) {
+            if (write_desktop_sh(root, app) < 0) idie("写入 desktop.sh 失败");
+        }
 
         char cfg[1024];
-        int cn = snprintf(cfg, sizeof cfg,
-            "set $mod Mod4\ndefault_border pixel 2\ndefault_floating_border pixel 2\n"
-            "exec %s/desktop.sh\n", root);
+        int cn;
+        if (app && *app)
+            cn = snprintf(cfg, sizeof cfg,
+                "set $mod Mod4\ndefault_border pixel 2\ndefault_floating_border pixel 2\n"
+                "exec %s/desktop.sh\n", root);
+        else
+            cn = snprintf(cfg, sizeof cfg,
+                "set $mod Mod4\ndefault_border pixel 2\ndefault_floating_border pixel 2\n");
         snprintf(path, sizeof path, "%s/cfg/sway/config", root);
         write_file(path, cfg, (size_t)cn, 0644);
 
@@ -982,7 +991,8 @@ static void usage(void) {
         "wstream %s — 隔离的无头 Wayland 虚拟桌面 + 实时画面/输入\n\n"
         "用法：\n"
         "  wstream start [WxH] [--app/-A 程序]  起隔离沙箱并推流（默认 1600x1000，端口 8765）\n"
-        "                             --app/-A：沙箱打开指定程序；默认开命令行+毫秒时钟两窗口\n"
+        "                             --app/-A：启动即打开该程序；默认沙箱是空桌面，\n"
+        "                             交互命令行/毫秒时钟由页面上的两个按钮按需打开\n"
         "                             多实例：重复 start 自动新建；显式 WSTREAM_ROOT/WSTREAM_PORT 复用指定实例\n"
         "  wstream stop               停止本实例（WSTREAM_ROOT 指定，默认 /tmp/wstream）\n"
         "  wstream list [--url] [-p PORT]   列出运行中的实例\n"

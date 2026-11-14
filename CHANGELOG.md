@@ -4,6 +4,30 @@
 
 ## [Unreleased]
 
+### 变更
+
+- **沙箱启动后不再自动开窗口**：原先 `wstream start` 会立刻拉起「交互命令行 +
+  毫秒时钟」两扇窗，现在默认是**空桌面**，两扇窗改由页面状态栏上的
+  「命令行」「时钟」按钮按需打开（WS `type 12`，A = 预设编号）。
+  理由：想先看干净桌面只能停实例重建；agent 只想截图时那两扇窗总挡在画面里。
+  `--app/-A 程序` 语义不变（启动即打开，仍走 `desktop.sh`）。
+  已有同名窗口时按钮不会开第二扇（服务端查 sway 窗口树），并带 1 秒冷却。
+  `clients/wstream_client.py` 增 `open_window(preset)`。
+
+### 修复
+
+- **`stop-all` 在实例目录被删后认不出孤儿 sway**：实例归属原先靠「root 下的
+  `.pid` 文件」或「cmdline 含 `<root>/`」判断，而默认实例的那条 cmdline 证据
+  来自 `desktop.sh`。不再自动写 `desktop.sh` 后它消失了，目录一删就留下孤儿
+  `sway-nocap`（lifecycle 第 4 节抓到）。现在 sway 显式带
+  `-c <root>/cfg/sway/config`，证据不再依赖窗口脚本。
+
+### 测试
+
+- `tests/lifecycle.py` 增第 5b 节：按需开窗口能拉起、重复点不出第二扇、
+  窗口不继承 `DISPLAY`（隔离红线）、`stop` 按归属零残留；第 1 节改为断言
+  「默认实例不起 `desktop.sh`、没有自动窗口、`/windows` 为空」。
+
 ## [0.9] - 2026-11-13
 
 ### 变更

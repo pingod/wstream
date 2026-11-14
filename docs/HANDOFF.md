@@ -75,18 +75,19 @@ agent 在沙箱里操作，两者物理上不共享输入设备。
 | **`/snapshot.jpg`** | 20 路并发全部完整 JPEG | ✅ |
 | **`/windows`** | 坐标与 `swaymsg` 一致 | ✅ |
 | **Python 客户端库** | ASCII/中文/大写全部「真的落到终端」 | ✅ |
+| **按需开窗口（type 12）** | 页面按钮 / `ws.open_window()` 拉起命令行与时钟；重复点不出第二扇；不继承 `DISPLAY` | ✅ |
 | CI | GitHub Actions 编译 + 零警告 + 冒烟测试 + 注入回归 | ✅ 全绿 |
 | 来源校验 | 恶意 `Origin` / `Host` 回 403，正常客户端不受影响 | ✅ |
 | 并发安全 | ASan + UBSan 下 5 路 WS 反复连断 + MJPEG 流压测 | ✅ 无报告 |
 
 ---
 
-## 3. ⚠️ 三十八个不能再踩的坑（最重要的一节）
+## 3. ⚠️ 四十个不能再踩的坑（最重要的一节）
 
 这些是花了大量时间定位出来的，**改动相关代码前务必先读**。
 前 5 条会直接让功能失效，坑 6 是安全问题，坑 7 会随机崩溃/越界，
 坑 8~10 让鼠标「点不准/点不动」，坑 11 会打坏键盘，坑 12 是文档纠错，
-坑 13~16 是剪贴板，坑 17~20 是 1.3.0 新踩的，坑 21~22 是多实例，坑 23~24 是**隔离性事故**（最严重），坑 25~27 是进程泄漏，坑 28~29 是测试自身的坑（`setsid` 让 terminate 失效、sway JSON 的 null），坑 30~34 是 1.5.0 审计加固（snprintf 越界、-s 占端口、剪贴板竞争/超时、客户端帧长误判、bash 参数解析），坑 35 是裸二进制串流真实桌面的隔离脚枪，坑 36 是 readdir 无序误拿 .lock 当 socket，坑 37~38 是 IME(v2)/音频的评估结论。
+坑 13~16 是剪贴板，坑 17~20 是 1.3.0 新踩的，坑 21~22 是多实例，坑 23~24 是**隔离性事故**（最严重），坑 25~27 是进程泄漏，坑 28~29 是测试自身的坑（`setsid` 让 terminate 失效、sway JSON 的 null），坑 30~34 是 1.5.0 审计加固（snprintf 越界、-s 占端口、剪贴板竞争/超时、客户端帧长误判、bash 参数解析），坑 35 是裸二进制串流真实桌面的隔离脚枪，坑 36 是 readdir 无序误拿 .lock 当 socket，坑 37~38 是 IME(v2)/音频的评估结论，坑 39 是默认实例不写 `desktop.sh` 后 sway 的归属证据，坑 40 是多线程进程里 fork 后 setenv/malloc。
 
 ### 坑 1：键盘键码**绝对不能 +8**
 
@@ -565,6 +566,34 @@ XWayland 剪贴板）已可用；真要做 v2，先把 XML 拿到手。
 PipeWire + null sink 才能「有」音频，但那样输出基本静音（除非 app 真在播放），
 且 CI 容器通常没装 pipewire，回归测不了。**音频不是 wstream 的核心价值**（核心是
 隔离图形操作），别为了「有声音」在沙箱里塞一整套音频栈。
+
+### 坑 39：默认实例不写 `desktop.sh` 后，sway 的归属证据要靠 `-c`
+
+`stop-all` 判断「这个进程属于哪个实例」有两条证据（`instance_root_of()`）：
+root 下的 `.pid` 文件，或 cmdline 里出现 `<root>/`。默认实例原先唯一提供第二条
+证据的是 `desktop.sh`（`exec /tmp/wstream/desktop.sh`）。把自动窗口改掉、
+默认实例不再写 `desktop.sh` 之后，目录一旦被删（`lifecycle.py` 第 4 节就这么干），
+`stop-all` 就认不出这棵进程树了 —— 实测留下孤儿 `sway-nocap`，每轮一个。
+
+现在 `spawn_sway()` 显式传 `-c <root>/cfg/sway/config`，cmdline 里永远有 root 路径。
+**改 sway 启动参数时别把这个 `-c` 去掉**，它同时决定了 stop/stop-all 能不能收尸。
+
+### 坑 40：多线程进程里别 fork 之后 setenv/malloc
+
+「按需开窗口」（WS type 12）要在 wstream 进程里 spawn 一个 alacritty。用
+`fork()` + 子进程里 `setenv()`/`malloc()` 是错的：wstream 有网络线程、抓帧主线程、
+剪贴板回调，父进程可能正持着 malloc 锁，子进程复制到那把锁就永远解不开 ——
+表现为「按钮点了，窗口偶尔才出来，其它时候卡死」。
+
+改用 `posix_spawnp()`（glibc 内部 clone + exec，不在子进程里跑我们的代码），
+环境数组在父进程里先拼好，`DISPLAY`/`WAYLAND_SOCKET` 在拼的时候剔除。
+另外两件事同样重要：
+
+- **不能在持有 `g_cl_mu` 时做这件事**。启动前要读 sway IPC（connect+recv，2 秒
+  超时），卡在那里等于卡住 push_frame，画面直接冻住。所以只入队，由
+  `launch_thread` 慢慢做。
+- **必须 `POSIX_SPAWN_SETSID`**，否则窗口进程挂在 wstream 的会话下，
+  wstream 退出时容易连带出问题；而且它得自己成组才好按归属清理。
 
 ---
 

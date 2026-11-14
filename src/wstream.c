@@ -31,6 +31,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -42,6 +43,7 @@
 #include <dirent.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <getopt.h>
@@ -1317,6 +1319,11 @@ static const char INDEX_HTML[] =
     "font:inherit;font-size:11px;cursor:pointer;letter-spacing:.05em}\n"
     "#tog:hover{background:#1d4ed8}\n"
     "#tog.on{background:#374151}\n"
+    "#win{display:inline-flex;gap:6px;margin-left:6px}\n"
+    "#win button{background:#374151;color:#e5e7eb;border:0;border-radius:6px;padding:4px 10px;"
+    "font:inherit;font-size:11px;cursor:pointer;letter-spacing:.05em;text-transform:none}\n"
+    "#win button:hover{background:#4b5563}\n"
+    "#win button:active{background:#1f2937}\n"
     "#mask{position:absolute;inset:0;display:flex;flex-direction:column;gap:6px;"
     "align-items:center;justify-content:center;background:#0009;color:#fff;font-size:14px;"
     "letter-spacing:.1em;cursor:pointer;text-transform:uppercase;backdrop-filter:blur(2px);"
@@ -1324,8 +1331,10 @@ static const char INDEX_HTML[] =
     "#mask small{font-size:10px;letter-spacing:.06em;color:#bbb;text-transform:none}\n"
     "</style></head><body>\n"
     "<div id=wrap><img id=v src=\"/stream.mjpg\"><canvas id=cv style=\"display:none;max-width:100%;max-height:100%;background:#000\"></canvas><div id=cur></div>"
-    "<div id=mask><span>点击查看沙箱画面</span><small>只关闭蒙版，不会接管键鼠</small></div></div>\n"
-    "<div id=bar>agent sandbox · <b id=st>连接中…</b> · <button id=tog>接管键鼠</button> · 同一时刻只有一人能操作 · Ctrl+Esc 释放</div>\n"
+    "<div id=mask><span>点击查看沙箱画面</span><small>点这里只关闭蒙版，不接管键鼠 · 窗口用下方「命令行 / 时钟」按钮打开</small></div></div>\n"
+    "<div id=bar>agent sandbox · <b id=st>连接中…</b> · <button id=tog>接管键鼠</button>"
+    "<span id=win><button data-preset=1>命令行</button><button data-preset=2>时钟</button></span>"
+    " · 同一时刻只有一人能操作 · Ctrl+Esc 释放</div>\n"
     "<div id=clipbar>📋 <b id=st2>剪贴板未同步</b> · Ctrl+Shift+V 粘贴到我电脑</div>\n"
     "<div id=keys class=keysel><span class=grip>⣿</span>发送快捷键：</div>\n"
     "<input id=k autocomplete=off spellcheck=false>\n"
@@ -1592,6 +1601,21 @@ static const char INDEX_HTML[] =
     "function hideMask(){mask.style.display='none';}\n"
     "mask.addEventListener('click',e=>{e.stopPropagation();hideMask();});\n"
     "syncTog();\n"
+    "/* ---------- 按需打开沙箱窗口 ----------\n"
+    " * 沙箱启动时是空桌面（不再自动开命令行/时钟）。这两个按钮发 type 12，\n"
+    " * A = 预设编号，服务端在沙箱里拉起对应程序。\n"
+    " * ⚠️ 不需要接管：开窗口不是输入事件。但开完要操作窗口，仍需点「接管键鼠」。\n"
+    " * 按钮点两下不会出两扇窗 —— 服务端会先查窗口树里是否已有同 app_id 的窗口。 */\n"
+    "for(const b of document.querySelectorAll('#win button')){\n"
+    "  b.addEventListener('click',e=>{\n"
+    "    e.stopPropagation();\n"
+    "    if(!ws||ws.readyState!==1){st.textContent='未连接，稍后再试';return;}\n"
+    "    send(12,parseInt(b.dataset.preset,10),0);\n"
+    "    st.textContent='已请求打开窗口…';\n"
+    "    setTimeout(()=>{if(active)st.textContent='已接管 · 可操作沙箱';\n"
+    "      else st.textContent='画面 + 输入已连接';},1500);\n"
+    "  });\n"
+    "}\n"
     "/* 快捷键栏拖动：按住左侧握把移动，位置记在 localStorage */\n"
     "(function(){\n"
     "  const bar=document.getElementById('keys'),grip=bar.querySelector('.grip');\n"
@@ -2175,27 +2199,47 @@ static void js_skip_value(struct json_scan *sc) {
         sc->p++;
 }
 
-/* 把窗口列表转成 JSON 输出 */
-static void sway_extract_windows(const char *json, char *out, size_t cap) {
-    struct json_window wins[32];
+/* 把窗口树 JSON 扫成窗口数组，返回个数。 */
+static int sway_scan_windows(const char *json, struct json_window *wins, int cap) {
     struct json_scan sc;
     memset(&sc, 0, sizeof sc);
     sc.p = json;
     sc.end = json + strlen(json);
     sc.out = wins;
-    sc.out_cap = 32;
+    sc.out_cap = cap;
 
     js_ws(&sc);
     if (sc.p < sc.end && *sc.p == '{') {
         /* 顶层对象会递归进 nodes，最终把所有窗口收进 wins */
         js_object(&sc, 0);
     }
+    return sc.out_n;
+}
+
+/* 沙箱里是否已经有某个 app_id 的窗口。
+ * 读不到窗口树（非 sway / IPC 不通）时返回 0：宁可多开一个，也不要把按钮做成
+ * 在别的合成器上永远打不开。 */
+static int sway_window_exists(const char *app_id) {
+    char *tree = sway_get_tree();
+    if (!tree) return 0;
+    struct json_window wins[32];
+    int n = sway_scan_windows(tree, wins, 32);
+    free(tree);
+    for (int i = 0; i < n; i++)
+        if (!strcmp(wins[i].app_id, app_id)) return 1;
+    return 0;
+}
+
+/* 把窗口列表转成 JSON 输出 */
+static void sway_extract_windows(const char *json, char *out, size_t cap) {
+    struct json_window wins[32];
+    int wn = sway_scan_windows(json, wins, 32);
 
     size_t o = 0;
     int k = snprintf(out + o, cap - o, "{\"windows\":[");
     if (k < 0 || (size_t)k >= cap) { out[0] = 0; return; }
     o = (size_t)k;
-    for (int i = 0; i < sc.out_n; i++) {
+    for (int i = 0; i < wn; i++) {
         /* 转义 title */
         char esc[512];
         size_t eo = 0;
@@ -2439,6 +2483,193 @@ static int clip_dequeue(char *out, size_t cap, size_t *out_len) {
     return got;
 }
 
+/* ---------- 按需打开沙箱窗口（WS type 12） ----------
+ *
+ * 以前沙箱一起床就自动开「交互命令行 + 毫秒时钟」两个窗口。问题是：想先看一个
+ * 干净桌面时没有别的办法，只能停掉实例重建；而且 agent 只是想拿一张截图时，
+ * 那两扇窗总在画面里。
+ *
+ * 现在沙箱起完是空的，窗口由浏览器上的两个按钮触发（type 12，A = 预设编号）：
+ *   1 = 交互命令行（app_id AgentTop）
+ *   2 = 毫秒时钟（app_id AgentSub，用来确认画面是实时的）
+ *
+ * 三条约束：
+ *   ① 子进程必须继承沙箱的 XDG_RUNTIME_DIR/WAYLAND_DISPLAY，并**显式去掉
+ *      DISPLAY** —— 否则 GTK/Qt 程序优先连 X11，会开在用户真实桌面上（坑 5）。
+ *   ② 不能在 fork 之后做 setenv/malloc：这是多线程进程，网络线程可能正持着
+ *      malloc 锁，子进程会死锁。改用 posix_spawnp（glibc 内部用 clone+exec，
+ *      不在子进程里跑我们的代码）。
+ *   ③ 同一预设已有窗口就不再起第二个（按钮点两下不该出两扇窗），并加 1 秒
+ *      冷却，防止脚本连发把 alacritty 刷爆。
+ *
+ * 返回：0 = 已启动，1 = 窗口已存在，2 = 启动失败，3 = 未知预设。 */
+static const char *const LAUNCH_TERM[] = {
+    "alacritty", "--class", "AgentTop", "-e", "sh", "-i", NULL
+};
+static const char *const LAUNCH_CLOCK[] = {
+    "alacritty", "--class", "AgentSub", "-e", "sh", "-c",
+    "while :; do printf \"窗口 2  %s.%s\\n\" \"$(date +%H:%M:%S)\" "
+    "\"$(date +%N | cut -c1-3)\"; sleep 0.05; done", NULL
+};
+
+static pthread_mutex_t g_launch_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_launch_last[2];   /* 上次启动时刻（ms），用于冷却 */
+/* 收掉已经退出的子进程（窗口关掉后不留僵尸）。只在流模式下有子进程，
+ * 所以 waitpid(-1) 不会误收别人的。 */
+static void reap_children(void) {
+    while (waitpid(-1, NULL, WNOHANG) > 0) { }
+}
+
+/* 复制一份当前环境，去掉会让程序连到用户真实桌面的变量。返回 malloc 的
+ * NULL 结尾数组（调用方释放每个元素和数组本身）。失败返回 NULL。 */
+static char **sandbox_envp(void) {
+    extern char **environ;
+    int n = 0;
+    while (environ[n]) n++;
+    char **out = calloc((size_t)n + 1, sizeof *out);
+    if (!out) return NULL;
+    int o = 0;
+    for (int i = 0; i < n; i++) {
+        const char *e = environ[i];
+        if (!strncmp(e, "DISPLAY=", 8) || !strncmp(e, "WAYLAND_SOCKET=", 15))
+            continue;
+        out[o] = strdup(e);
+        if (!out[o]) {
+            for (int j = 0; j < o; j++) free(out[j]);
+            free(out);
+            return NULL;
+        }
+        o++;
+    }
+    out[o] = NULL;
+    return out;
+}
+
+static int launch_preset(int preset) {
+    const char *const *argv;
+    const char *app_id;
+    if (preset == 1)      { argv = LAUNCH_TERM;  app_id = "AgentTop"; }
+    else if (preset == 2) { argv = LAUNCH_CLOCK; app_id = "AgentSub"; }
+    else return 3;
+
+    pthread_mutex_lock(&g_launch_mu);
+    if (sway_window_exists(app_id)) {   /* 已经开着：按钮点两下不该出两扇窗 */
+        pthread_mutex_unlock(&g_launch_mu);
+        return 1;
+    }
+    uint32_t now = now_ms();
+    int slot = preset - 1;
+    if (g_launch_last[slot] && now - g_launch_last[slot] < 1000) {
+        pthread_mutex_unlock(&g_launch_mu);
+        return 1;   /* 冷却中：当作「已请求」，别刷屏 */
+    }
+    g_launch_last[slot] = now;
+    reap_children();
+
+    /* 子进程输出落到 <runtime>/windows.log，排查「按钮点了没窗口」时能看原因 */
+    char logpath[512];
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (rt && *rt) snprintf(logpath, sizeof logpath, "%s/windows.log", rt);
+    else snprintf(logpath, sizeof logpath, "/dev/null");
+
+    char **envp = sandbox_envp();
+    if (!envp) { pthread_mutex_unlock(&g_launch_mu); return 2; }
+
+    char *cargv[16];
+    int ac = 0;
+    while (argv[ac] && ac < 15) { cargv[ac] = (char *)argv[ac]; ac++; }
+    cargv[ac] = NULL;
+
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t attr;
+    int rc = 2;
+    if (posix_spawn_file_actions_init(&fa) == 0) {
+        int dn = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (dn >= 0) {
+            posix_spawn_file_actions_adddup2(&fa, dn, 0);
+            posix_spawn_file_actions_addclose(&fa, dn);
+        }
+        int lf = open(logpath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (lf >= 0) {
+            posix_spawn_file_actions_adddup2(&fa, lf, 1);
+            posix_spawn_file_actions_adddup2(&fa, lf, 2);
+            posix_spawn_file_actions_addclose(&fa, lf);
+        } else {
+            posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+            posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+        }
+        if (posix_spawnattr_init(&attr) == 0) {
+            /* setsid：窗口进程自己成组，wstream 退出不会连带收掉它，
+             * 也避免它继承我们（无窗口）的会话。 */
+            short fl = POSIX_SPAWN_SETSID;
+            posix_spawnattr_setflags(&attr, fl);
+            pid_t pid = 0;
+            if (posix_spawnp(&pid, cargv[0], &fa, &attr, cargv, envp) == 0) {
+                rc = 0;
+                logf_("🪟 已按需打开窗口：%s（pid %d）", app_id, (int)pid);
+            } else {
+                logf_("⚠️ 打开窗口失败：%s（沙箱里没装 %s？）", app_id, cargv[0]);
+            }
+            posix_spawnattr_destroy(&attr);
+        }
+        posix_spawn_file_actions_destroy(&fa);
+    }
+    for (int i = 0; envp[i]; i++) free(envp[i]);
+    free(envp);
+    pthread_mutex_unlock(&g_launch_mu);
+    return rc;
+}
+
+/* 启动请求队列 + 专职线程。
+ *
+ * ⚠️ 为什么不能直接在 handle_msg 里启动：那是在持有 g_cl_mu 的情况下跑的，而
+ * launch_preset() 要读 sway IPC（connect + recv，最长 2 秒超时）。卡在那里等于
+ * 卡住 push_frame 和整个抓帧循环 —— 画面直接冻住。所以只把预设编号塞进队列，
+ * 由独立线程慢慢做。 */
+static struct {
+    int q[8];
+    int head, tail, count;
+} g_lq;
+static pthread_mutex_t g_lq_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_lq_cv = PTHREAD_COND_INITIALIZER;
+static int g_lq_stop;
+
+static int launch_request(int preset) {
+    int ok = -1;
+    pthread_mutex_lock(&g_lq_mu);
+    if (g_lq.count < (int)(sizeof g_lq.q / sizeof g_lq.q[0])) {
+        g_lq.q[g_lq.tail] = preset;
+        g_lq.tail = (g_lq.tail + 1) % (int)(sizeof g_lq.q / sizeof g_lq.q[0]);
+        g_lq.count++;
+        ok = 0;
+        pthread_cond_signal(&g_lq_cv);
+    }
+    pthread_mutex_unlock(&g_lq_mu);
+    return ok;
+}
+
+static void *launch_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        int preset = 0;
+        pthread_mutex_lock(&g_lq_mu);
+        while (!g_lq_stop && g_lq.count == 0)
+            pthread_cond_wait(&g_lq_cv, &g_lq_mu);
+        if (g_lq_stop && g_lq.count == 0) {
+            pthread_mutex_unlock(&g_lq_mu);
+            break;
+        }
+        preset = g_lq.q[g_lq.head];
+        g_lq.head = (g_lq.head + 1) % (int)(sizeof g_lq.q / sizeof g_lq.q[0]);
+        g_lq.count--;
+        pthread_mutex_unlock(&g_lq_mu);
+
+        int rc = launch_preset(preset);
+        if (rc == 3) logf_("⚠️ 未知窗口预设：%d", preset);
+    }
+    return NULL;
+}
+
 /* 把 WS 帧负载交给注入器。
  * caller_id = 发送者 client id，**调用方必须持有 g_cl_mu**（要读 g_owner）。 */
 static void handle_msg(unsigned long caller_id, const uint8_t *m, size_t n) {
@@ -2497,6 +2728,15 @@ static void handle_msg(unsigned long caller_id, const uint8_t *m, size_t n) {
         /* 订阅 H.264 视频（WS 下行 0x82）；m[4]!=0 开、0 关。调用方已持 g_cl_mu。 */
         int idx = client_by_id(caller_id);
         if (idx >= 0) clients[idx].want_video = m[4] != 0;
+        return;
+    }
+    if (type == 12) {
+        /* 按需打开预设窗口：A = 预设编号（1 命令行 / 2 毫秒时钟）。
+         * 和剪贴板一样**不要求输入权**：围观者也该能开窗口，而真正点/打字仍需
+         * 接管。启动本身丢给专职线程，这里只入队（见 launch_request 的说明）。 */
+        int preset = (int)((m[4]) | (m[5] << 8));
+        if (launch_request(preset) != 0)
+            logf_("⚠️ 窗口启动队列满，丢弃请求 %d", preset);
         return;
     }
 
@@ -2943,6 +3183,8 @@ static int stream_main(int argc, char **argv) {
     int srv = -1;
     pthread_t th = 0;
     int have_th = 0;
+    pthread_t lth = 0;
+    int have_lth = 0;
     if (!ppm_out) {
         srv = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (srv < 0) die("socket: %s", strerror(errno));
@@ -2968,6 +3210,9 @@ static int stream_main(int argc, char **argv) {
         if (pthread_create(&th, NULL, http_thread, (void *)(intptr_t)srv) != 0)
             die("创建网络线程失败");
         have_th = 1;
+        /* 按需开窗口的专职线程（见 launch_request 的说明：不能在网络线程里做） */
+        if (pthread_create(&lth, NULL, launch_thread, NULL) == 0)
+            have_lth = 1;
     }
 
     struct jpeg_enc enc;
@@ -3158,6 +3403,16 @@ static int stream_main(int argc, char **argv) {
         pthread_join(th, NULL);
     }
     if (srv >= 0) close(srv);
+    /* 专职线程要显式唤醒再 join：它平时阻塞在条件变量上 */
+    if (have_lth) {
+        pthread_mutex_lock(&g_lq_mu);
+        g_lq_stop = 1;
+        pthread_cond_broadcast(&g_lq_cv);
+        pthread_mutex_unlock(&g_lq_mu);
+        pthread_join(lth, NULL);
+    }
+    /* 我们自己起的窗口进程已 setsid，wstream 退出不影响它们；这里只回收僵尸。 */
+    reap_children();
     for (int i = 0; i < 2; i++) {
         wl_buffer_destroy(fb[i].wl_buf);
         munmap(fb[i].addr, fb[i].size);

@@ -46,9 +46,11 @@ WL=$(cat /tmp/wstream/wl_name)
 XDG_RUNTIME_DIR=/tmp/wstream/run WAYLAND_DISPLAY=$WL grim /tmp/s.png
 ```
 
-如果 `grim` 出来的图也是黑的 → 沙箱里没有窗口（`desktop.sh` 没跑起来）。
+如果 `grim` 出来的图也是黑的 → 沙箱里没有窗口。默认沙箱**就是空桌面**
+（命令行/时钟改由页面按钮触发），先点页面上的「命令行」按钮；`--app` 实例则是
+`desktop.sh` 没跑起来。
 
-**检查 3：`desktop.sh` 是否执行**
+**检查 3：`desktop.sh` 是否执行（只有 `--app` 实例才有这个文件）**
 
 ```bash
 pgrep -af desktop.sh

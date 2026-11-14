@@ -36,12 +36,13 @@
               │ wl_display (独立 socket)      ▲
               ▼                               │
 ┌──────────────────────────────────────────────────────────────────────┐
-│ 沙箱：sway --unsupported-gpu                                          │
-│   WLR_BACKENDS=headless  WLR_RENDERER=pixman                         │
+│ 沙箱：sway --unsupported-gpu -c /tmp/wstream/cfg/sway/config         │
+│   WLR_BACKENDS=headless  WLR_RENDERER=gles2                          │
 │   XDG_RUNTIME_DIR=/tmp/wstream/run  →  socket: wayland-1             │
 │                                                                       │
-│   ┌──────────┐  ┌──────────┐                                        │
-│   │ 窗口 1    │  │ 窗口 2    │   ← 沙箱里的程序，用户桌面看不到      │
+│   （默认空桌面）                                                       │
+│   ┌──────────┐  ┌──────────┐   ← 页面按钮按需拉起（WS type 12）；      │
+│   │ 命令行    │  │ 毫秒时钟  │     用户桌面看不到                       │
 │   └──────────┘  └──────────┘                                        │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -282,10 +283,9 @@ wstream start
   │
   ├─ 2. 没有 → 创建
   │     ├─ mkdir /tmp/wstream/{run,cfg/sway,out}
-  │     ├─ 写 desktop.sh（命令行 + 毫秒时钟；--app 时换成指定程序）
-  │     ├─ 写 sway config（含 exec desktop.sh）
-  │     ├─ setsid env -u DISPLAY sway --unsupported-gpu
-  │     │    └─ WLR_BACKENDS=headless WLR_RENDERER=pixman
+  │     ├─ 写 sway config（--app 时先写 desktop.sh 并在 config 里 exec 它）
+  │     ├─ setsid env -u DISPLAY sway --unsupported-gpu -c <root>/cfg/sway/config
+  │     │    └─ WLR_BACKENDS=headless WLR_RENDERER=gles2
   │     ├─ 动态探测 socket 名（wayland-0 / wayland-1 / ...）
   │     └─ wlr-randr 设分辨率
   │

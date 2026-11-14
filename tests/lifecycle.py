@@ -109,6 +109,17 @@ def port_http(port):
         return None
 
 
+def sandbox_windows(port):
+    """沙箱窗口列表（GET /windows）。失败返回 None。"""
+    import json
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/windows", timeout=5) as r:
+            return json.loads(r.read().decode("utf-8")).get("windows", [])
+    except Exception:
+        return None
+
+
 def main():
     if not os.access(os.path.join(REPO, "wstream"), os.X_OK):
         print("先编译：./build.sh")
@@ -142,8 +153,12 @@ def main():
         during = pids_of(root)
         names = {n for n, _ in during}
         check("运行时能看到 wstream", "wstream" in names, f"(实际={names})")
-        # 坑 25：desktop.sh 必须被 own_pids 认出来，否则 stop 清不掉
-        check("运行时能看到 desktop.sh", "desktop.sh" in names, f"(实际={names})")
+        # 默认实例**不再自动开窗口**（命令行/时钟改由浏览器按钮触发），
+        # 所以既不该有 desktop.sh，也不该有任何 alacritty。
+        check("默认实例不起 desktop.sh", "desktop.sh" not in names, f"(实际={names})")
+        check("默认实例没有自动窗口", "alacritty" not in names, f"(实际={names})")
+        wins = sandbox_windows(port)
+        check("默认沙箱启动后是空桌面", wins == [], f"(windows={wins})")
 
         r = run_stop(root)
         check("stop 成功返回", r.returncode == 0, r.stderr[-300:])
@@ -240,6 +255,61 @@ def main():
     left = runtime_pids(aroot)
     check("--app stop 零残留（按归属，不限名）", len(left) == 0, f"(残留={left})")
     shutil.rmtree(aroot, ignore_errors=True)
+
+    # ---------- 5b. 浏览器按钮按需开窗口（WS type 12）----------
+    # 沙箱启动后是空桌面，窗口由页面按钮触发。这里验证：能开、不重复开、
+    # 进程在沙箱里（不带 DISPLAY）、以及 stop 能按归属把它们清干净。
+    print("── 5b. 按需开窗口 + stop 按归属清理 ──")
+    wroot = root + "-win"
+    wport = port + 2
+    run_stop(wroot)
+    shutil.rmtree(wroot, ignore_errors=True)
+    r = run_start(wroot, wport)
+    check("按需窗口实例能起来", r.returncode == 0, r.stderr[-300:])
+    check("起完是空桌面", sandbox_windows(wport) == [],
+          f"(windows={sandbox_windows(wport)})")
+
+    sys.path.insert(0, os.path.join(REPO, "clients"))
+    launched = False
+    try:
+        import wstream_client
+        with wstream_client.WStream(port=wport) as ws:
+            ws.wait_ready()
+            check("type 12 能拉起命令行窗口", ws.open_window(1),
+                  f"(windows={sandbox_windows(wport)})")
+            launched = bool(ws.window(app_id="AgentTop"))
+            # 再点一次：不该出现第二扇
+            ws.open_window(1, wait=False)
+            time.sleep(3)
+            n_top = sum(1 for w in (sandbox_windows(wport) or [])
+                        if w.get("app_id") == "AgentTop")
+            check("重复点按钮不出第二扇窗", n_top == 1, f"(AgentTop 数量={n_top})")
+    except Exception as e:
+        check("type 12 能拉起命令行窗口", False, f"(异常={e})")
+        check("重复点按钮不出第二扇窗", False, f"(异常={e})")
+
+    if launched:
+        # 隔离红线（坑 5）：沙箱里起的窗口不能带 DISPLAY，否则会连用户真实 X11。
+        leaks = []
+        for pid in runtime_pids(wroot):
+            try:
+                with open(f"/proc/{pid}/environ", "rb") as f:
+                    envs = f.read().decode("utf-8", "replace").split("\0")
+            except OSError:
+                continue
+            if any(e.startswith("DISPLAY=") for e in envs):
+                try:
+                    comm = open(f"/proc/{pid}/comm").read().strip()
+                except OSError:
+                    comm = "?"
+                leaks.append(f"{comm}:{pid}")
+        check("按需窗口不继承 DISPLAY", not leaks, f"(泄漏={leaks})")
+
+    run_stop(wroot)
+    time.sleep(1)
+    left = runtime_pids(wroot)
+    check("按需窗口 stop 零残留", len(left) == 0, f"(残留={left})")
+    shutil.rmtree(wroot, ignore_errors=True)
 
     # ---------- 6. 多实例：裸 start 重复运行自动新建 ----------
     # ⚠️ 自动新建只在「默认根 /tmp/wstream + 8765」上发生，无法用临时 root 隔离。

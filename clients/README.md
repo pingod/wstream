@@ -20,6 +20,9 @@ with WStream() as ws:
     ws.wait_ready()                       # wstream start 刚返回时它可能还没初始化完
     ws.take()                             # ⚠️ 不调这个，所有输入都会被服务端丢弃
 
+    # 沙箱启动后是空桌面：先按需开窗口（等价于页面上的「命令行」按钮）
+    ws.open_window(1)                     # 1=命令行 AgentTop  2=毫秒时钟 AgentSub
+
     # 看有哪些窗口、各在哪
     for w in ws.windows():
         print(w["app_id"], w["title"], (w["cx"], w["cy"]))
@@ -48,6 +51,7 @@ with WStream() as ws:
 | `connect()` / `close()` / `with` | 连接管理 |
 | `take()` / `release()` | 取得 / 释放输入权（**必须先 take**） |
 | `windows()` | `[{app_id, title, x, y, width, height, cx, cy}]` |
+| `open_window(preset=1)` | 按需开窗口：1=命令行 2=毫秒时钟（沙箱默认空桌面） |
 | `window(app_id=, title_contains=)` | 找一个窗口 |
 | `move(x,y)` / `click(x,y)` / `click_window()` | 鼠标（像素坐标） |
 | `output_size()` | 沙箱分辨率 `(w,h)`；默认自动从 `/info` 探测 |

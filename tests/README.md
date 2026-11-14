@@ -2,7 +2,7 @@
 
 ## 为什么需要它
 
-wstream 有一堆「踩过就几小时」的坑（见 `docs/HANDOFF.md` 第 3 节，目前三十五个）。在这之前，
+wstream 有一堆「踩过就几小时」的坑（见 `docs/HANDOFF.md` 第 3 节，目前四十个）。在这之前，
 它们全靠人工复验 —— 每次改注入相关代码，都得手动点一遍、打个字、看看对不对。
 这个目录把那些检查变成了自动断言。
 
@@ -47,8 +47,8 @@ python3 tests/lifecycle.py
 
 | 文件 | 测什么 | 什么时候跑 |
 |---|---|---|
-| `tests/wstest.py` | **功能**：注入、来源校验、剪贴板、所有权、协议健壮性、隔离护栏、跑完不留垃圾（41 项） | 改了 src/wstream.c、前端 |
-| `tests/lifecycle.py` | **生命周期**：起停是否留垃圾、死 socket、孤儿清理（15 项） | 改了 `wstream start`/`stop` 生命周期逻辑 |
+| `tests/wstest.py` | **功能**：注入、来源校验、剪贴板、所有权、协议健壮性、隔离护栏、跑完不留垃圾（44 项） | 改了 src/wstream.c、前端 |
+| `tests/lifecycle.py` | **生命周期**：起停是否留垃圾、死 socket、孤儿清理、按需开窗口（31 项） | 改了 `wstream start`/`stop` 生命周期逻辑 |
 
 功能正常但每跑一次漏一批进程，这种 bug 不会让任何功能断言变红，只能靠
 `lifecycle.py` 抓。它只操作 `/tmp/wstream-lc-test`，不碰你的默认实例。
@@ -74,6 +74,7 @@ python3 tests/lifecycle.py     # 约 2 分钟，会真起停几次
 | 8 | 剪贴板双向同步 | data-control 不能要求焦点；type 7/8 不能被所有权拦掉 |
 | 9 | 修饰键释放 | Shift 松开后必须发 modifiers=0，否则 `Upper` → `UPPER` |
 | 10 | 跑完不留测试窗口 | `setsid` 让 terminate 失效 → 幽灵窗口（坑 28） |
+| 11 | 默认实例不起窗口、按需按钮能拉起 | 空桌面是默认行为；`DISPLAY` 不泄漏（坑 5/40） |
 
 ## ⚠️ 最重要的一条：`DISPLAY` 绝不能硬编码 `":0"`
 
@@ -117,6 +118,12 @@ DISPLAY=:1 xdotool search --name "WSTREAM_X11_PROBE" | wc -l    # 期望 1
 同类的坑：任何碰 `WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` / `DISPLAY` 的工具
 （`grim`、`wlr-randr`、`wl-copy`、`wl-paste`、`xdotool`、`xwd`）都必须显式指向沙箱。
 曾经还发生过：抓截图忘了设 `XDG_RUNTIME_DIR`，抓出了用户的真实桌面。
+
+**按需开窗口（WS type 12）同样受这条约束。** 默认沙箱是空桌面，窗口由页面按钮
+或 `WStream.open_window()` 拉起；服务端 `sandbox_envp()` 会剔除 `DISPLAY` 再
+`posix_spawnp`。`lifecycle.py` 第 5b 节把这条做成硬断言：遍历该实例的进程，
+任何 `environ` 里带 `DISPLAY=` 的都判失败 —— 这是本项目最严重的事故类型，
+不能只靠人工看截图确认。
 
 ## 六个容易踩的测试环境问题
 

@@ -248,8 +248,8 @@ def kill_stale_test_windows(env):
             # 沙箱外的 alacritty（用户自己开的终端）绝对不能碰。
             if not _belongs_to_sandbox(pid):
                 continue
-            # 沙箱里的 alacritty 还有 desktop.sh 起的演示终端（AgentTop/AgentSub），
-            # 那些是沙箱体验的一部分，不能杀 —— 只清测试自己起的 WStreamTest。
+            # 沙箱里可能有浏览器按钮按需开的窗口（AgentTop/AgentSub），
+            # 那些是用户自己开的，不能杀 —— 只清测试自己起的 WStreamTest。
             if name == "alacritty" and not _cmdline_has(pid, "WStreamTest"):
                 continue
             try:

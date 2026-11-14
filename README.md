@@ -147,14 +147,15 @@ sudo pacman -S --needed gcc pkgconf wayland wayland-protocols \
 ```bash
 ./wstream start              # 默认 1600x1000
 ./wstream start 1920x1080    # 指定分辨率
-./wstream start --app firefox  # 沙箱打开指定程序（窗口1 仍是命令行）
+./wstream start --app firefox  # 沙箱启动即打开该程序（默认是空桌面，窗口由页面按钮开）
 ./wstream stop               # 停止
 ```
 
 wstream start 会：
 1. 起一个 `sway --unsupported-gpu`，`WLR_BACKENDS=headless`（无头）
-2. 在沙箱里开两个窗口：一个**交互命令行** + 一个**毫秒时钟**（方便确认画面是实时的）；
-   用 `--app/-A 程序` 时把时钟窗口换成该程序（原生窗口，GUI 可用）
+2. **沙箱起来是空桌面** —— 交互命令行和毫秒时钟不再自动打开，改由页面上的
+   两个按钮（「命令行」/「时钟」）按需拉起（WS `type 12`）。用 `--app/-A 程序`
+   时仍然是启动即打开该程序（显式要求，走 `desktop.sh`）
 3. 起 `wstream` 监听 `127.0.0.1:8765`
 
 ### 直接推流任意 wlroots 合成器
@@ -282,7 +283,8 @@ Content-Length: 81234
 ```bash
 curl -s http://127.0.0.1:8765/snapshot.jpg -o /tmp/now.jpg
 curl -s http://127.0.0.1:8765/windows
-# {"windows":[{"app_id":"AgentTop","x":0,"y":0,"width":640,"height":720,"cx":320,"cy":360}]}
+# 默认沙箱是空桌面：{"windows":[]}
+# 页面点「命令行」后：{"windows":[{"app_id":"AgentTop","x":0,"y":0,"width":640,"height":720,"cx":320,"cy":360}]}
 ```
 
 > **为什么 `/windows` 不用 `zwlr_foreign_toplevel_management`**：那个协议
@@ -323,6 +325,7 @@ curl -s http://127.0.0.1:8765/windows
 | `6` **控制** | action（1=取权 0=释放） | 0 | 输入所有权 |
 | `7` **写剪贴板** | 0 | 0 | 8 字节头 + UTF-8 负载，设成沙箱剪贴板 |
 | `8` **读剪贴板** | 0 | 0 | 请求沙箱剪贴板，响应走下行 `0x81` |
+| `12` **开窗口** | preset（1=命令行 2=时钟） | 0 | 在沙箱里按需打开预设窗口，不需要输入权 |
 
 > ⚠️ **A/B 的符号性随 type 变化**：坐标是无符号 16 位（0..65535），
 > 滚动步数是有符号 16 位。服务端必须按 type 分开解释，否则屏幕右半边
@@ -653,7 +656,9 @@ WSTREAM_ROOT=/tmp/ws-a ./wstream stop
 ```
 
 `wstream stop-all` 的安全设计：只按 **XDG_RUNTIME_DIR 归属**判断，绝不按进程名裸杀
-（`sway` 这个名字你桌面也在用）。它会连 `desktop.sh` 和沙箱里的窗口程序一起清掉 ——
+（`sway` 这个名字你桌面也在用）。实例目录被删后，它靠 sway cmdline 里的 `<root>/`
+认出孤儿（sway 现在显式带 `-c <root>/cfg/sway/config`，这正是原先由 `desktop.sh`
+提供的那条证据），再按归属把该实例的其余进程（含页面按钮开的窗口）一并收掉 ——
 这些以前会残留，每跑一轮漏一批。
 
 ### 资源成本
