@@ -82,12 +82,12 @@ agent 在沙箱里操作，两者物理上不共享输入设备。
 
 ---
 
-## 3. ⚠️ 四十一个不能再踩的坑（最重要的一节）
+## 3. ⚠️ 四十三个不能再踩的坑（最重要的一节）
 
 这些是花了大量时间定位出来的，**改动相关代码前务必先读**。
 前 5 条会直接让功能失效，坑 6 是安全问题，坑 7 会随机崩溃/越界，
 坑 8~10 让鼠标「点不准/点不动」，坑 11 会打坏键盘，坑 12 是文档纠错，
-坑 13~16 是剪贴板，坑 17~20 是 1.3.0 新踩的，坑 21~22 是多实例，坑 23~24 是**隔离性事故**（最严重），坑 25~27 是进程泄漏，坑 28~29 是测试自身的坑（`setsid` 让 terminate 失效、sway JSON 的 null），坑 30~34 是 1.5.0 审计加固（snprintf 越界、-s 占端口、剪贴板竞争/超时、客户端帧长误判、bash 参数解析），坑 35 是裸二进制串流真实桌面的隔离脚枪，坑 36 是 readdir 无序误拿 .lock 当 socket，坑 37~38 是 IME(v2)/音频的评估结论，坑 39 是默认实例不写 `desktop.sh` 后 sway 的归属证据，坑 40 是多线程进程里 fork 后 setenv/malloc，坑 41 是 keydown 里 preventDefault 吞掉 paste 事件。
+坑 13~16 是剪贴板，坑 17~20 是 1.3.0 新踩的，坑 21~22 是多实例，坑 23~24 是**隔离性事故**（最严重），坑 25~27 是进程泄漏，坑 28~29 是测试自身的坑（`setsid` 让 terminate 失效、sway JSON 的 null），坑 30~34 是 1.5.0 审计加固（snprintf 越界、-s 占端口、剪贴板竞争/超时、客户端帧长误判、bash 参数解析），坑 35 是裸二进制串流真实桌面的隔离脚枪，坑 36 是 readdir 无序误拿 .lock 当 socket，坑 37~38 是 IME(v2)/音频的评估结论，坑 39 是默认实例不写 `desktop.sh` 后 sway 的归属证据，坑 40 是多线程进程里 fork 后 setenv/malloc，坑 41 是 keydown 里 preventDefault 吞掉 paste 事件，坑 42~43 是多 agent 共用实例的两个成因（端口静默成功、继承 SWAYSOCK）。
 
 ### 坑 1：键盘键码**绝对不能 +8**
 
@@ -615,6 +615,33 @@ root 下的 `.pid` 文件，或 cmdline 里出现 `<root>/`。默认实例原先
 **怎么测出来**：在页面里同时挂 keydown 和 paste 两个探针，对比「接管」与
 「释放」两种状态。释放时 keydown 提前 return、不取消默认行为，paste 正常触发 ——
 这个 A/B 对照 30 秒就能定位，比读代码猜快得多。
+
+---
+
+### 坑 42：端口被别人的实例占着时 `start` 会静默成功
+
+`start_instance` 原先只等 `port_serving(port)` 变真就判定成功。当端口被**别的
+实例**占着时：我们自己的 wstream 因 `EADDRINUSE` 立刻退出，而别人的实例照常应答
+—— `start` 报告「浏览器打开 http://127.0.0.1:8765」，那其实是别人的沙箱。
+两个 agent 从此共用同一个实例、互相抢输入权（后 `take()` 的抢走前一个，前一个的
+输入被静默丢弃，只留一行「忽略无输入权的客户端」日志）。
+
+现在：**起沙箱之前**先确认「这个端口上没有别的实例在服务」，有就直接报错退出
+（exit 1）。放在后面失败会留下一个 sway 进程。等待 wstream 就绪时也要求
+「我们 fork 的那个进程还活着」，不再只看端口有没有人应答。
+
+判据必须是「本实例的 wstream **且**端口是 port」——只看「本实例有 wstream 在跑」
+会漏掉「本实例跑在 8766、8765 被别人占着」这种情况。
+
+### 坑 43：`spawn_sway` 没清 `SWAYSOCK`，多实例几乎必现
+
+sway 会用 `SWAYSOCK` 绑定自己的 IPC socket。多 agent 场景里，前一个实例的 shell
+通常 `export SWAYSOCK=/tmp/wstream/run/sway-ipc...`，于是新沙箱的 sway 报
+`Unable to bind IPC socket` 直接退出，`wstream start` 报「连不上 Wayland」——
+看起来像沙箱坏了，其实是继承了别人的 socket 路径。
+
+`spawn_sway` 现在显式 `unsetenv("SWAYSOCK")` 和 `unsetenv("I3SOCK")`。
+（`DISPLAY` 早就清了，`SWAYSOCK` 是漏掉的那个。）
 
 ---
 

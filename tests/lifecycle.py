@@ -109,6 +109,22 @@ def port_http(port):
         return None
 
 
+def _port_of_instance(root):
+    """该实例（root）里 wstream 实际监听的端口。读不到返回 None。"""
+    for pid in runtime_pids(root):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().decode("utf-8", "replace").split("\0")
+        except OSError:
+            continue
+        if not argv or "wstream" not in os.path.basename(argv[0]):
+            continue
+        for i, a in enumerate(argv):
+            if a == "-p" and i + 1 < len(argv) and argv[i + 1].isdigit():
+                return int(argv[i + 1])
+    return None
+
+
 def sandbox_windows(port):
     """沙箱窗口列表（GET /windows）。失败返回 None。"""
     import json
@@ -310,6 +326,82 @@ def main():
     left = runtime_pids(wroot)
     check("按需窗口 stop 零残留", len(left) == 0, f"(残留={left})")
     shutil.rmtree(wroot, ignore_errors=True)
+
+    # ---------- 5c. 端口冲突必须失败，不能静默挂到别人的实例上 ----------
+    # 真实踩到过：两个 agent 各设一个 WSTREAM_ROOT、都没设端口，
+    # 第二个实例的 wstream 因 EADDRINUSE 退出，而第一个实例照常应答 8765，
+    # 于是 start 报告「成功」，两边共用同一个沙箱、互相抢输入权。
+    print("── 5c. 端口被别的实例占着必须报错 ──")
+    a_root = root + "-coll-a"
+    b_root = root + "-coll-b"
+    cport = port + 3
+    for rr in (a_root, b_root):
+        run_stop(rr)
+        shutil.rmtree(rr, ignore_errors=True)
+    r = run_start(a_root, cport)
+    check("占用端口的实例能起来", r.returncode == 0, r.stderr[-300:])
+    # 另一个 root 显式要同一个端口 → 必须失败
+    r = run_start(b_root, cport)
+    out = r.stdout + r.stderr
+    check("端口冲突时 start 失败（非 0 退出）", r.returncode != 0, f"(rc={r.returncode})")
+    check("端口冲突有明确提示", "已被另一个 wstream 实例占用" in out, f"(输出={out[-200:]!r})")
+    check("端口冲突不留下沙箱进程", len(runtime_pids(b_root)) == 0,
+          f"(残留={runtime_pids(b_root)})")
+    check("冲突后原实例仍在线", port_http(cport) == 200)
+    run_stop(a_root)
+    time.sleep(1)
+    shutil.rmtree(a_root, ignore_errors=True)
+    shutil.rmtree(b_root, ignore_errors=True)
+
+    # ---------- 5d. 只给 root 不给端口：不能撞别人的端口 ----------
+    print("── 5d. 只给 WSTREAM_ROOT 时自动避开被占用的端口 ──")
+    d_root = root + "-auto-a"
+    e_root = root + "-auto-b"
+    run_stop(d_root)
+    run_stop(e_root)
+    shutil.rmtree(d_root, ignore_errors=True)
+    shutil.rmtree(e_root, ignore_errors=True)
+    env = dict(os.environ, WSTREAM_ROOT=d_root)
+    env.pop("WSTREAM_PORT", None)
+    r1 = subprocess.run([BIN, "start", "1024x600"], env=env,
+                        capture_output=True, text=True, timeout=120)
+    check("首个实例（隐式端口）能起来", r1.returncode == 0, r1.stderr[-300:])
+    port1 = _port_of_instance(d_root)
+    env2 = dict(os.environ, WSTREAM_ROOT=e_root)
+    env2.pop("WSTREAM_PORT", None)
+    r2 = subprocess.run([BIN, "start", "1024x600"], env=env2,
+                        capture_output=True, text=True, timeout=120)
+    check("第二个实例（隐式端口）能起来", r2.returncode == 0, r2.stderr[-300:])
+    port2 = _port_of_instance(e_root)
+    check("两个实例端口不同", port1 and port2 and port1 != port2,
+          f"(port1={port1} port2={port2})")
+    check("两个实例都在线", port_http(port1) == 200 and port_http(port2) == 200,
+          f"(port1={port1} port2={port2})")
+    for rr in (d_root, e_root):
+        run_stop(rr)
+        shutil.rmtree(rr, ignore_errors=True)
+
+    # ---------- 5e. 继承来的 SWAYSOCK 不能影响新沙箱 ----------
+    # 多 agent 场景里，前一个实例的 shell 往往 export 过 SWAYSOCK。sway 会用它
+    # 绑定自己的 IPC socket，于是新沙箱报 "Unable to bind IPC socket" 起不来，
+    # 表现为「连不上 Wayland」。spawn_sway 现在显式 unsetenv。
+    print("── 5e. 继承的 SWAYSOCK 不影响新沙箱 ──")
+    f_root = root + "-swaysock"
+    fport = port + 4
+    run_stop(f_root)
+    shutil.rmtree(f_root, ignore_errors=True)
+    fenv = dict(os.environ, WSTREAM_ROOT=f_root, WSTREAM_PORT=str(fport),
+                SWAYSOCK="/tmp/definitely-not-this-instance/sway-ipc.1.2.sock")
+    r = subprocess.run([BIN, "start", "1024x600"], env=fenv,
+                       capture_output=True, text=True, timeout=120)
+    check("继承坏 SWAYSOCK 时实例仍能起来", r.returncode == 0,
+          (r.stdout + r.stderr)[-300:])
+    check("该实例端口可服务", port_http(fport) == 200)
+    run_stop(f_root)
+    time.sleep(1)
+    check("该实例 stop 零残留", len(runtime_pids(f_root)) == 0,
+          f"(残留={runtime_pids(f_root)})")
+    shutil.rmtree(f_root, ignore_errors=True)
 
     # ---------- 6. 多实例：裸 start 重复运行自动新建 ----------
     # ⚠️ 自动新建只在「默认根 /tmp/wstream + 8765」上发生，无法用临时 root 隔离。

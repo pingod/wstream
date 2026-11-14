@@ -2,6 +2,44 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.10.2] - 2026-11-14
+
+### 修复
+
+- **端口被别的实例占着时 `start` 会静默成功，导致多个 agent 共用同一个沙箱**。
+  真实场景：两个 agent 各设一个 `WSTREAM_ROOT`、都没设 `WSTREAM_PORT`，
+  于是都去抢 8765。第二个实例的 wstream 因 `EADDRINUSE` 立刻退出，而第一个
+  实例照常在 8765 应答 —— `start` 看到 `port_serving()` 为真就报告「浏览器打开
+  8765」，两边从此共用同一个沙箱、互相抢输入权（`🔁 输入权转移`，被抢走的一
+  方的输入被静默丢弃）。
+  现在：端口被别的实例占着就**直接报错退出**（exit 1），并且在起沙箱之前检查
+  （放在后面失败时会留下一个 sway 进程）。等待 wstream 就绪时也要求「我们 fork
+  的那个进程还活着」，不再只看端口有没有人应答。
+- **只给 `WSTREAM_ROOT`、不给端口时**：优先复用它已占的端口（重复 start 仍是
+  复用语义），否则自动挑一个空闲端口；以前会盲目用 8765 从而撞上别的实例。
+
+### 文档
+
+- `skills/wstream/SKILL.md` 新增「你的实例是谁」：症状、根因、以及动手前的
+  三步自检（`./wstream list`、`echo $WSTREAM_ROOT $WSTREAM_PORT`、
+  `curl :PORT/info` 看宽高是否与自己 start 的一致）。多 agent 一节改为
+  显式 root+port 并强调「记下端口」。
+
+- **继承来的 `SWAYSOCK` 会让新沙箱起不来**：sway 用它绑定自己的 IPC socket，
+  而多 agent 场景里前一个实例的 shell 往往 `export` 过它 —— 新沙箱报
+  `Unable to bind IPC socket` 后退出，`wstream start` 报「连不上 Wayland」。
+  `spawn_sway` 现在显式 `unsetenv("SWAYSOCK")` / `unsetenv("I3SOCK")`。
+- **按需开窗口偶发出现两扇同名窗**：`type 12` 判重原先只看 sway 窗口树，而
+  alacritty 从 exec 到 map 窗口之间有几百毫秒空窗期，这期间再点一次就会起第二个。
+  现在同时记录上次启动的 pid，还活着就直接跳过（lifecycle 第 5b 节实测偶发
+  `AgentTop 数量=2`）。
+
+### 测试
+
+- `lifecycle.py` 增第 5c 节（端口冲突必须失败、有明确提示、不留沙箱进程、
+  原实例不受影响）、第 5d 节（只给 root 时自动避开被占端口，两个实例都独立在线）、
+  第 5e 节（继承坏的 `SWAYSOCK` 时新沙箱仍能起来）。
+
 ## [0.10.1] - 2026-11-14
 
 ### 修复

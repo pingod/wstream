@@ -428,6 +428,14 @@ static pid_t spawn_sway(const char *root, const char *sway_bin,
         int dn = open("/dev/null", O_RDONLY);
         if (dn >= 0) { dup2(dn, 0); close(dn); }
         unsetenv("DISPLAY");
+        /* ⚠️ 必须清掉继承来的 SWAYSOCK / I3SOCK：sway 会用它们绑定自己的 IPC
+         * socket，而调用方（用户桌面跑 sway/i3，或另一个 wstream 实例的 shell）
+         * 环境里通常就带着一个指向**别处**的路径 —— 于是新 sway 报
+         * "Unable to bind IPC socket" 直接退出，`wstream start` 报
+         * 「连不上 Wayland」。这个坑在「多 agent 各起一个实例」时几乎必现，
+         * 因为前一个实例的 shell 里就 export 过 SWAYSOCK。 */
+        unsetenv("SWAYSOCK");
+        unsetenv("I3SOCK");
         setenv("XDG_RUNTIME_DIR", rundir, 1);
         setenv("XDG_CONFIG_HOME", cfgdir, 1);
         setenv("WLR_BACKENDS", "headless", 1);
@@ -543,9 +551,44 @@ static void dump_log_tail(const char *path) {
     fprintf(stderr, "\n──────────────────\n");
 }
 
+/* 从 wstream 进程 cmdline 里读 -p 端口。读不到返回 0。 */
+static int port_of_pid(pid_t pid) {
+    char cmd[4096];
+    if (pid_cmdline(pid, cmd, sizeof cmd) < 0) return 0;
+    char *p = strstr(cmd, "-p ");
+    if (!p) return 0;
+    return atoi(p + 3);
+}
+
 /* ---------------------------------------------------------------- start */
 
 static int start_instance(const char *root, int port, const char *size, const char *app) {
+    /* ⚠️ 第一件事：确认这个端口不是**别的实例**在服务。
+     *
+     * 原逻辑只等 port_serving(port) 变真就判定成功。于是当端口被别人的实例占着时：
+     * 我们自己的 wstream 因 EADDRINUSE 立刻退出，而别人的实例照常应答 ——
+     * start 报告「浏览器打开 http://127.0.0.1:8765」，但那其实是别人的沙箱。
+     * 两个 agent 于是共用同一个实例、互相抢输入权（真实踩到）。
+     *
+     * 必须在**起沙箱之前**检查：放在后面的话失败时已经留下一个 sway 进程。 */
+    {
+        pid_t wp0[64];
+        int wn0 = scan_comm("wstream", wp0, 64);
+        /* 注意判据是「本实例的 wstream **且**端口是 port」，不能只看「本实例有
+         * wstream 在跑」：那样本实例跑在 8766、而 8765 被别人占着时，会被误判成
+         * 「是我自己的」而放行。 */
+        int mine_serving = 0;
+        for (int i = 0; i < wn0; i++)
+            if (belongs_to_root(wp0[i], root) && pid_alive(wp0[i]) &&
+                port_of_pid(wp0[i]) == port)
+                mine_serving = 1;
+        if (!mine_serving && port_serving(port))
+            idie("端口 %d 已被另一个 wstream 实例占用（不是 %s 这个实例）。\n"
+                 "  两边会连到同一个沙箱、互相抢输入权，所以直接失败而不是假装成功。\n"
+                 "  换个端口：WSTREAM_ROOT=%s WSTREAM_PORT=<空闲端口> ./wstream start\n"
+                 "  看谁占着：./wstream list", port, root, root);
+    }
+
     char wl[256] = "";
     find_wl_socket(root, wl, sizeof wl);
 
@@ -678,18 +721,19 @@ static int start_instance(const char *root, int port, const char *size, const ch
         snprintf(path, sizeof path, "%s/wstream.pid", root);
         write_pid(path, wpid);
 
+        /* ⚠️ 不能只看 port_serving()：那个端口可能是别人在应答（见上）。
+         * 必须同时要求「我们 fork 的这个进程还活着」，它死了就是 bind 失败。 */
         uint32_t dl = ims() + 20000;
         while (ims() < dl) {
-            if (port_serving(port)) break;
             if (!pid_alive(wpid)) {
                 snprintf(path, sizeof path, "%s/wstream.log", root);
                 dump_log_tail(path);
-                idie("wstream 启动后立即退出（日志见上）");
+                idie("wstream 启动后立即退出（日志见上；端口被占用是最常见原因）");
             }
+            if (port_serving(port)) break;
             msleep(200);
         }
         if (!port_serving(port)) {
-            char path[512];
             snprintf(path, sizeof path, "%s/wstream.log", root);
             dump_log_tail(path);
             idie("wstream 已启动但端口 %d 一直不可服务", port);
@@ -748,13 +792,19 @@ struct inst {
     int npids;
 };
 
-/* 从 wstream 进程 cmdline 里读 -p 端口。读不到返回 0。 */
-static int port_of_pid(pid_t pid) {
-    char cmd[4096];
-    if (pid_cmdline(pid, cmd, sizeof cmd) < 0) return 0;
-    char *p = strstr(cmd, "-p ");
-    if (!p) return 0;
-    return atoi(p + 3);
+/* 某个实例（root）里 wstream 正在用的端口；没有返回 0。
+ * 用于「只给了 WSTREAM_ROOT、没给端口」时复用自己已占的端口，
+ * 而不是傻乎乎再抢一个。 */
+static int port_of_root(const char *root) {
+    pid_t pids[64];
+    int n = scan_comm("wstream", pids, 64);
+    for (int i = 0; i < n; i++) {
+        if (is_zombie(pids[i]) || !pid_alive(pids[i])) continue;
+        if (!belongs_to_root(pids[i], root)) continue;
+        int port = port_of_pid(pids[i]);
+        if (port > 0) return port;
+    }
+    return 0;
 }
 
 static int cmd_list(int argc, char **argv) {
@@ -1088,6 +1138,30 @@ int instance_main(int argc, char **argv) {
         char auto_root[128];
         int port_explicit = (ports && *ports);
         int root_explicit = (getenv("WSTREAM_ROOT") && *getenv("WSTREAM_ROOT"));
+
+        /* 只给了 root、没给端口：先用自己已占的端口（重复 start = 复用），
+         * 否则从默认端口起找一个空闲的。
+         *
+         * ⚠️ 为什么不能直接用 8765：两个 agent 各设一个 WSTREAM_ROOT、都不设端口时，
+         * 第二个实例会绑到已被占用的 8765 —— 它的 wstream 因 EADDRINUSE 退出，
+         * 而 8765 上别人的实例照常应答，于是两边**共用同一个沙箱**、互相抢输入权。
+         * 这是真实踩到的「多个 agent 用同一个实例」。 */
+        if (root_explicit && !port_explicit) {
+            int mine = port_of_root(root);
+            if (mine > 0) {
+                port = mine;
+            } else {
+                int i;
+                for (i = 0; i < 100; i++)
+                    if (!port_serving(DEFAULT_PORT + i)) break;
+                if (i >= 100)
+                    idie("找不到空闲端口（%d..%d 全被占用）",
+                         DEFAULT_PORT, DEFAULT_PORT + 99);
+                port = DEFAULT_PORT + i;
+                if (i > 0)
+                    ilog("端口 %d 已被其它实例占用，本实例改用 %d", DEFAULT_PORT, port);
+            }
+        }
         if (!root_explicit && !port_explicit) {
             int i;
             for (i = 0; i < 100; i++) {

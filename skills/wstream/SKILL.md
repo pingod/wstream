@@ -38,18 +38,75 @@ metadata:
 ```bash
 cd ~/githome/wstream          # 或任何 clone 下来的位置
 ./build.sh                    # 首次需要编译
-./wstream version            # 当前版本（如 0.3）
-./wstream start              # 默认 1600x1000，端口 8765
+./wstream version            # 当前版本（如 0.10.1）
+
+# ⚠️ 一律显式指定自己的实例，别用裸 ./wstream start —— 见下方「你的实例是谁」
+export WSTREAM_ROOT=/tmp/ws-<你的标识> WSTREAM_PORT=<空闲端口>
+./wstream start              # 默认 1600x1000
 ./wstream start --app <程序>   # 可选：启动即打开指定程序（默认空桌面，窗口由页面按钮开）
 ```
 
-然后告诉用户：**浏览器打开 <http://127.0.0.1:8765>，点一下画面就能接管**。
+然后告诉用户：**浏览器打开 <http://127.0.0.1:<你的端口>>，点一下画面就能接管**。
 
 停止：
 
 ```bash
-./wstream stop
+./wstream stop               # 停的就是 $WSTREAM_ROOT 那个实例
 ```
+
+### ⚠️ 你的实例是谁：多个 agent 共用同一实例是最常见的坑
+
+**症状**：你在点按钮/打字，画面上却出现了别人操作的结果；`take()` 之后输入还是
+被丢弃（提示「无输入权」）；或者 `/windows` 里的窗口你根本没开过。
+
+**根因**：所有 agent 都用裸 `./wstream start` / 默认端口 `8765`，于是连到了
+**同一个实例**。服务端是「单输入权」模型：后 `take()` 的客户端会把输入权抢走
+（`🔁 输入权转移`），前面那个 agent 的后续输入就全被静默丢弃。
+
+**所以规则是：每个 agent 必须有自己的 `WSTREAM_ROOT` + `WSTREAM_PORT`。**
+
+```bash
+# 用会话/任务标识做 root，避免和其他 agent 撞
+export WSTREAM_ROOT=/tmp/ws-$USER-<任务名>     # 例：/tmp/ws-pavia-fix-login
+export WSTREAM_PORT=8810                       # 每个 agent 用不同端口
+./wstream start 1280x720
+```
+
+**动手前先确认这三件事**（30 秒，能省掉几小时的误判）：
+
+```bash
+./wstream list                 # ① 有几个实例？端口各是多少？
+echo "$WSTREAM_ROOT $WSTREAM_PORT"   # ② 自己的是哪一套（别是空 / 8765）
+curl -s http://127.0.0.1:$WSTREAM_PORT/info   # ③ 这个端口确实是你的沙箱（看 width/height）
+```
+
+判据：`/info` 的宽高应该和**你** `start` 时的分辨率一致。对不上 = 你连到了别人的实例。
+
+**两个已知会「串实例」的成因**（v0.10.2 起都已修，但值得知道）：
+
+1. 端口被别人的实例占着时，以前 `start` 会**静默成功**（自己的 wstream 因
+   `EADDRINUSE` 退出，别人的实例照常应答，于是报告「浏览器打开 8765」）。
+   现在直接报错退出。
+2. 继承来的 `SWAYSOCK` 会让新沙箱的 sway 绑不上 IPC socket 而起不来，
+   表现为「连不上 Wayland」。现在 `spawn_sway` 会清掉它。
+   —— 所以**不要在你的 shell 里 export SWAYSOCK 去给 wstream 用**，
+   那是给 `swaymsg` 的，wstream 自己会处理。
+
+**几个必须知道的语义**（v0.10.2 起）：
+
+| 命令 | 行为 |
+|---|---|
+| `./wstream start`（什么都不设） | 默认实例被占 → **自动新建** `/tmp/wstream-2`、端口顺延 |
+| `WSTREAM_ROOT=… ./wstream start`（不给端口） | 优先复用它已占的端口；否则自动挑一个空闲端口 |
+| `WSTREAM_ROOT=… WSTREAM_PORT=…` | 严格用这两个；**端口被别人的实例占着就直接失败**（不再假装成功） |
+| `WSTREAM_ROOT=… ./wstream stop` | 只停这个实例 |
+
+> 以前「端口被别人的实例占着」会**静默成功**：自己的 wstream 因 `EADDRINUSE`
+> 立刻退出，而别人的实例照常在 8765 应答，`start` 就报告「浏览器打开 8765」——
+> 于是两个 agent 共用同一个沙箱。现在这种冲突会直接报错退出（exit 1）。
+
+**浏览器页面也一样**：多人看同一个实例时，页面上只有一个「接管键鼠」能生效。
+如果你在浏览器里操作却发现按键进了别人的窗口，先看 `./wstream list`。
 
 ### 首次安装依赖（Arch / CachyOS）
 
@@ -270,8 +327,12 @@ WSTREAM_ROOT=/tmp/ws-agent1 WSTREAM_PORT=8801 ./wstream start
 WSTREAM_ROOT=/tmp/ws-agent2 WSTREAM_PORT=8802 ./wstream start
 ```
 
-更省事：直接重复 `./wstream start`，默认实例被占用时自动新建（`/tmp/wstream-2`… + 端口顺延），
-用 `./wstream list` 看各实例端口。
+裸 `./wstream start` 也会在默认实例被占时自动新建（`/tmp/wstream-2`… + 端口顺延），
+但**不推荐依赖它**：你得从输出里读端口，而下一个 agent 可能又拿了同一个名字。
+显式 root+port 才是稳定的。
+
+**关键**：起完一定要把端口记下来，后面所有调用（`WStream(port=…)`、`curl`、
+浏览器地址）都用**这个**端口。用 8765 是最常见的「连到别人沙箱」来源。
 
 然后各用各的端口：
 
@@ -396,6 +457,8 @@ hyprctl cursorpos
 | 打字乱码（a→l） | 键码多加了 8 | 见 `docs/HANDOFF.md` 坑 1 |
 | 打字完全无反应 | WS 帧不是 8 字节 | 见 `docs/HANDOFF.md` 坑 2 |
 | **所有输入都没反应** | 没取输入权（type 6 action=1） | 先 `take(s)`，见坑 7 相关 |
+| **输入时好时坏 / 被静默丢弃** | 另一个 agent 抢走了输入权（共用实例） | `./wstream list` + `curl :PORT/info` 确认是自己的实例，见第 1 节 |
+| **画面里出现我没开的窗口** | 连到了别的 agent 的实例（端口撞了） | 同上；用独立 `WSTREAM_ROOT`+`WSTREAM_PORT` 重启 |
 | **点哪里都不准** | `motion_absolute` 坐标要像素不是归一化 | 见坑 8；脚本用 `move()` 即可 |
 | **点击没反应** | 按钮码要 BTN_LEFT(0x110) | 见坑 10 |
 | **页面读剪贴板超时** | type 7/8 被输入权拦了 / 主循环没查 g_clip_dirty | 见坑 15 |

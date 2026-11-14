@@ -615,8 +615,32 @@ WSTREAM_ROOT=/tmp/ws-a WSTREAM_PORT=8801 ./wstream start
 WSTREAM_ROOT=/tmp/ws-b WSTREAM_PORT=8802 ./wstream start
 ```
 
-更省事：直接**重复 `./wstream start`**——默认实例被占用时会自动新建（`/tmp/wstream-2`、`-3`…
-并顺延端口 8766、8767…），无需手动指定。显式 `WSTREAM_ROOT`/`WSTREAM_PORT` 则复用/指定实例（幂等）。
+**给 agent 用请一律显式 root + port**。裸 `./wstream start` 虽然也会在默认实例被占时
+自动新建（`/tmp/wstream-2`、`-3`… 并顺延端口），但端口要从输出里读，多 agent 并发时
+容易互相串到同一个实例上。
+
+### ⚠️ 端口冲突现在会直接失败（0.10.2 起）
+
+以前「端口被别人的实例占着」会**静默成功**：自己的 wstream 因 `EADDRINUSE` 立刻退出，
+而别人的实例照常在该端口应答，`start` 看到端口有响应就报告成功 —— 于是两个 agent
+共用同一个沙箱、互相抢输入权（后 `take()` 的把前一个的输入权抢走，前一个的输入
+被静默丢弃）。
+
+现在：
+
+| 命令 | 行为 |
+|---|---|
+| 端口被别的实例占着 | **直接报错退出（exit 1）**，且在起沙箱之前就失败，不留进程 |
+| 只给 `WSTREAM_ROOT`、不给端口 | 优先复用它已占的端口；否则自动挑一个空闲端口 |
+| `WSTREAM_ROOT` + `WSTREAM_PORT` 都给 | 严格按这两个，冲突即失败 |
+
+**自检三步**（怀疑连错了实例时）：
+
+```bash
+./wstream list                                # 有几个实例、端口各是多少
+echo "$WSTREAM_ROOT $WSTREAM_PORT"            # 自己那套是什么
+curl -s http://127.0.0.1:$WSTREAM_PORT/info   # 宽高应与你 start 时的分辨率一致
+```
 
 | 资源 | 隔离方式 |
 |---|---|

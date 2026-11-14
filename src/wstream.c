@@ -2554,6 +2554,26 @@ static const char *const LAUNCH_CLOCK[] = {
 
 static pthread_mutex_t g_launch_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_launch_last[2];   /* 上次启动时刻（ms），用于冷却 */
+/* 上次为各预设启动的进程 pid（0 = 没起过 / 已退出）。
+ *
+ * ⚠️ 为什么要记 pid 而不只查窗口树：alacritty 从 exec 到 map 窗口之间有
+ * 几百毫秒的空窗期，这段时间里 sway 的窗口树还看不到它。如果只靠
+ * sway_window_exists() 判重，这期间再点一次按钮就会起第二扇窗 ——
+ * lifecycle 第 5b 节实测偶发「AgentTop 数量=2」。
+ * pid 还活着就直接跳过，不受这个时序影响。 */
+static pid_t g_launch_pid[2];
+
+/* 进程还活着吗（僵尸算死）。wstream.c 里原本没有这个判断 —— instance.c 的
+ * pid_alive 不在这里可见，而且那个版本还要读 /proc/<pid>/stat 判僵尸；
+ * 这里只需要「有没有退」，kill(pid,0) 加一次 waitpid 探活就够了。 */
+static int child_alive(pid_t pid) {
+    if (pid <= 0) return 0;
+    if (kill(pid, 0) < 0 && errno != EPERM) return 0;
+    /* 已退出但还没 reap 的：waitpid 返回 pid 说明它是僵尸 */
+    int st = 0;
+    pid_t r = waitpid(pid, &st, WNOHANG);
+    return r == 0;   /* 0 = 还在跑 */
+}
 /* 收掉已经退出的子进程（窗口关掉后不留僵尸）。只在流模式下有子进程，
  * 所以 waitpid(-1) 不会误收别人的。 */
 static void reap_children(void) {
@@ -2593,12 +2613,17 @@ static int launch_preset(int preset) {
     else return 3;
 
     pthread_mutex_lock(&g_launch_mu);
+    int slot = preset - 1;
+    /* 上一轮起的进程还活着 → 视为已开（覆盖「已 exec 但窗口还没 map」的空窗期） */
+    if (g_launch_pid[slot] && child_alive(g_launch_pid[slot])) {
+        pthread_mutex_unlock(&g_launch_mu);
+        return 1;
+    }
     if (sway_window_exists(app_id)) {   /* 已经开着：按钮点两下不该出两扇窗 */
         pthread_mutex_unlock(&g_launch_mu);
         return 1;
     }
     uint32_t now = now_ms();
-    int slot = preset - 1;
     if (g_launch_last[slot] && now - g_launch_last[slot] < 1000) {
         pthread_mutex_unlock(&g_launch_mu);
         return 1;   /* 冷却中：当作「已请求」，别刷屏 */
@@ -2646,6 +2671,7 @@ static int launch_preset(int preset) {
             pid_t pid = 0;
             if (posix_spawnp(&pid, cargv[0], &fa, &attr, cargv, envp) == 0) {
                 rc = 0;
+                g_launch_pid[slot] = pid;
                 logf_("🪟 已按需打开窗口：%s（pid %d）", app_id, (int)pid);
             } else {
                 logf_("⚠️ 打开窗口失败：%s（沙箱里没装 %s？）", app_id, cargv[0]);
