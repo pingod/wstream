@@ -412,7 +412,10 @@ static pid_t spawn_sway(const char *root, const char *sway_bin) {
         setenv("XDG_RUNTIME_DIR", rundir, 1);
         setenv("XDG_CONFIG_HOME", cfgdir, 1);
         setenv("WLR_BACKENDS", "headless", 1);
-        setenv("WLR_RENDERER", "pixman", 1);
+        /* pixman 是纯软件渲染，不导出 zwp_linux_dmabuf_v1；Vulkan/EGL 客户端（gpui、
+         * 游戏、视频播放器）因此无法创建 surface，会直接失败。用 gles2 走 EGL，
+         * headless 后端可用 GPU 或 llvmpipe；WSTREAM_RENDERER 可覆盖。 */
+        setenv("WLR_RENDERER", getenv("WSTREAM_RENDERER") ? getenv("WSTREAM_RENDERER") : "gles2", 1);
         setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
         setenv("__EGL_VENDOR_LIBRARY_FILENAMES",
                "/usr/share/glvnd/egl_vendor.d/50_mesa.json", 1);

@@ -364,3 +364,39 @@ tail -f /tmp/wstream/wstream.log
 2. `WAYLAND_DEBUG=client` 的协议流（截取相关片段）
 3. 合成器类型和版本（`sway --version` / `labwc --version`）
 4. `wayland-info` 输出（确认协议可用性）
+
+
+## 沙箱里的程序起不来：`Failed to create surface: PlatformNotSupported`
+
+**症状**：Vulkan/EGL 客户端（gpui/Zed 系、游戏、部分视频播放器）在沙箱里直接 panic：
+
+```
+panicked at ...: Failed to create surface: PlatformNotSupported
+```
+
+或 `blade-graphics ... ERROR_SURFACE_LOST_KHR`。
+
+**原因**：`WLR_RENDERER=pixman` 是纯软件渲染，**不导出 `zwp_linux_dmabuf_v1`**。
+这些客户端需要 dmabuf 才能建 surface，于是 `vkGetPhysicalDeviceSurfaceSupportKHR`
+返回 false，被 blade 判为 `PlatformNotSupported`。
+
+**确认**：
+
+```bash
+ROOT=/tmp/wstream; WL=$(cat $ROOT/wl_name)
+XDG_RUNTIME_DIR=$ROOT/run WAYLAND_DISPLAY=$WL wayland-info | grep dmabuf
+# 没有输出 = 就是这个问题
+```
+
+**修复**：用 `gles2` 渲染器（headless 后端走 EGL，GPU 或 llvmpipe 都行）。
+`1.5.1` 起默认已改为 `gles2`，可用 `WSTREAM_RENDERER` 覆盖：
+
+```bash
+WSTREAM_RENDERER=gles2 ./wstream start
+```
+
+修复后 `wayland-info` 应能看到：
+
+```
+interface: 'zwp_linux_dmabuf_v1',  version: 5
+```
