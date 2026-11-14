@@ -26,3 +26,6 @@ Thumbs.db
 __pycache__/
 *.pyc
 .ghcache/
+
+# 发版产物（gh release 上传用，不入库）
+/wstream-v*-x86_64-linux.tar.gz
