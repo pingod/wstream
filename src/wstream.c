@@ -1486,8 +1486,12 @@ static const char INDEX_HTML[] =
     "  if(!active)return;\n"
     "  if(e.key==='Escape'&&e.ctrlKey){e.preventDefault();release();return;}\n"
     "  if(composing)return;              /* 交给 IME，不要抢 */\n"
-    "  /* 粘贴：Ctrl+V / Cmd+V 由 paste 事件处理，这里吞掉避免重复 */\n"
-    "  if((e.ctrlKey||e.metaKey)&&(e.key==='v'||e.key==='V')){e.preventDefault();return;}\n"
+    "  /* ⚠️ Ctrl+V / Cmd+V：**绝对不能 preventDefault**。\n"
+    "   * 浏览器的默认动作（派发 paste 事件 + 插入文本）是 keydown 的默认行为，\n"
+    "   * 这里一取消，paste 事件就根本不会派发，下面的粘贴处理器永远不执行 ——\n"
+    "   * 现象就是「粘贴板功能不能用」。只 return 不发送按键即可，\n"
+    "   * 真正防止文本插进 #k 由 paste 处理器里的 preventDefault 负责。 */\n"
+    "  if((e.ctrlKey||e.metaKey)&&(e.key==='v'||e.key==='V'))return;\n"
     "  e.preventDefault();\n"
     "  const c=evdev(e);if(!c)return;\n"
     "  const cp=_nonAsciiKey(e);\n"
@@ -1517,6 +1521,29 @@ static const char INDEX_HTML[] =
     " *     有独立 keymap，打不了中文。走剪贴板粘贴则所有程序都能用。\n"
     " *   Ctrl+Shift+V：反过来，把**沙箱的**剪贴板内容贴到我自己的电脑上。\n"
     " */\n"
+    "/* 焦点窗口是不是终端？终端里粘贴是 Ctrl+Shift+V（Ctrl+V 是引号转义，\n"
+    " * 见 README 坑 19），GUI 程序才是 Ctrl+V。沙箱默认窗口恰好是终端，\n"
+    " * 所以这个判断不做的话，中文粘贴几乎必然失败。\n"
+    " * 数据来自 /windows 的 focused 字段（sway 的真实焦点），认不出来就当 GUI。 */\n"
+    "const TERMS=['alacritty','foot','kitty','wezterm','xterm','urxvt','konsole',\n"
+    "  'gnome-terminal','terminator','tmux','终端'];\n"
+    "/* 返回 Promise<boolean>：焦点窗口是不是终端。取不到就当不是。 */\n"
+    "function focusIsTerminal(){\n"
+    "  return fetch('/windows').then(r=>r.json()).then(j=>{\n"
+    "    const f=(j.windows||[]).find(w=>w.focused);\n"
+    "    if(!f)return false;\n"
+    "    const hay=((f.app_id||'')+' '+(f.title||'')).toLowerCase();\n"
+    "    return TERMS.some(t=>hay.includes(t));\n"
+    "  }).catch(()=>false);\n"
+    "}\n"
+    "/* 发粘贴组合键。term=true 时用 Ctrl+Shift+V。 */\n"
+    "function sendPaste(term){\n"
+    "  send(4,29,1);\n"
+    "  if(term)send(4,42,1);          /* Shift */\n"
+    "  send(4,47,1); send(4,47,0);    /* v */\n"
+    "  if(term)send(4,42,0);\n"
+    "  send(4,29,0);\n"
+    "}\n"
     "k.addEventListener('paste',e=>{\n"
     "  if(!active)return;\n"
     "  e.preventDefault();\n"
@@ -1526,9 +1553,11 @@ static const char INDEX_HTML[] =
     "  if(asciiOnly){\n"
     "    sendText(raw);              /* 纯 ASCII 直接逐键打，最省事 */\n"
     "  }else{\n"
-    "    /* 含非 ASCII：走剪贴板，保证 Xwayland 程序也能收到 */\n"
-    "    clipPush(raw);\n"
-    "    setTimeout(()=>{ send(4,29,1); send(4,47,1); send(4,47,0); send(4,29,0); }, 120);\n"
+    "    /* 含非 ASCII：写进沙箱剪贴板再发粘贴键（Xwayland 也能收到）。\n"
+    "     * 必须**先**问清焦点再发，而且只发一次：终端里单独按 Ctrl+V 会进入\n"
+    "     * readline 的引号插入状态，紧接着再发 Ctrl+Shift+V 只会把那串键\n"
+    "     * 当字面文本插进去。 */\n"
+    "    focusIsTerminal().then(term=>{ clipPush(raw); setTimeout(()=>sendPaste(term),150); });\n"
     "  }\n"
     "  k.value='';\n"
     "});\n"
@@ -2020,6 +2049,7 @@ struct json_window {
     char title[192];
     int  x, y, w, h;
     int  has_app, has_rect;
+    int  focused;        /* sway 的 focused 标志：当前拿到键盘焦点的窗口 */
 };
 
 struct json_scan {
@@ -2131,6 +2161,15 @@ static void js_object(struct json_scan *sc, int depth) {
                 js_string(sc, sc->cur.title, sizeof sc->cur.title);
             else
                 js_skip_value(sc);
+        } else if (!strcmp(key, "focused")) {
+            /* sway 给的是 JSON 布尔值。这里只需知道真假，不用完整解析。 */
+            js_ws(sc);
+            if (sc->p < sc->end && *sc->p == 't') {
+                sc->cur.focused = 1;
+                while (sc->p < sc->end && *sc->p != ',' && *sc->p != '}') sc->p++;
+            } else {
+                js_skip_value(sc);
+            }
         } else if (!strcmp(key, "rect")) {
             js_ws(sc);
             if (sc->p < sc->end && *sc->p == '{') {
@@ -2255,10 +2294,11 @@ static void sway_extract_windows(const char *json, char *out, size_t cap) {
         char entry[1024];
         k = snprintf(entry, sizeof entry,
             "%s{\"app_id\":\"%s\",\"title\":\"%s\",\"x\":%d,\"y\":%d,"
-            "\"width\":%d,\"height\":%d,\"cx\":%d,\"cy\":%d}",
+            "\"width\":%d,\"height\":%d,\"cx\":%d,\"cy\":%d,\"focused\":%s}",
             i ? "," : "", wins[i].app_id, esc,
             wins[i].x, wins[i].y, wins[i].w, wins[i].h,
-            wins[i].x + wins[i].w / 2, wins[i].y + wins[i].h / 2);
+            wins[i].x + wins[i].w / 2, wins[i].y + wins[i].h / 2,
+            wins[i].focused ? "true" : "false");
         if (k < 0 || o + (size_t)k + 3 > cap) break;   /* 留 "]}" 和 NUL */
         memcpy(out + o, entry, (size_t)k);
         o += (size_t)k;

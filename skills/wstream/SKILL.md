@@ -402,6 +402,7 @@ hyprctl cursorpos
 | **X11 程序里中文进不去** | 逐键到不了 XWayland | 改用剪贴板粘贴 |
 | **大写字母变成全大写** | 修饰键释放时没发 modifiers | 见坑 18 |
 | **Ctrl+V 没反应、多出字母 v** | 每键推 keymap 清零修饰位 / 终端要 Ctrl+Shift+V | 见坑 17、19 |
+| **粘贴完全没反应** | keydown 里对 Ctrl+V `preventDefault` → `paste` 不派发 | 见坑 41 |
 | 握手回 403 | `Host`/`Origin` 不是本机来源 | 用 `Host: 127.0.0.1:8765`，别带外站 `Origin`，见坑 6 |
 | 服务随机崩 / 越界 | `clients[]` 跨 poll 用下标 | 见 `docs/HANDOFF.md` 坑 7 |
 | 窗口跑到用户桌面上 | 没 `env -u DISPLAY` | 见 `docs/HANDOFF.md` 坑 5 |

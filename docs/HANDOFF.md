@@ -82,12 +82,12 @@ agent 在沙箱里操作，两者物理上不共享输入设备。
 
 ---
 
-## 3. ⚠️ 四十个不能再踩的坑（最重要的一节）
+## 3. ⚠️ 四十一个不能再踩的坑（最重要的一节）
 
 这些是花了大量时间定位出来的，**改动相关代码前务必先读**。
 前 5 条会直接让功能失效，坑 6 是安全问题，坑 7 会随机崩溃/越界，
 坑 8~10 让鼠标「点不准/点不动」，坑 11 会打坏键盘，坑 12 是文档纠错，
-坑 13~16 是剪贴板，坑 17~20 是 1.3.0 新踩的，坑 21~22 是多实例，坑 23~24 是**隔离性事故**（最严重），坑 25~27 是进程泄漏，坑 28~29 是测试自身的坑（`setsid` 让 terminate 失效、sway JSON 的 null），坑 30~34 是 1.5.0 审计加固（snprintf 越界、-s 占端口、剪贴板竞争/超时、客户端帧长误判、bash 参数解析），坑 35 是裸二进制串流真实桌面的隔离脚枪，坑 36 是 readdir 无序误拿 .lock 当 socket，坑 37~38 是 IME(v2)/音频的评估结论，坑 39 是默认实例不写 `desktop.sh` 后 sway 的归属证据，坑 40 是多线程进程里 fork 后 setenv/malloc。
+坑 13~16 是剪贴板，坑 17~20 是 1.3.0 新踩的，坑 21~22 是多实例，坑 23~24 是**隔离性事故**（最严重），坑 25~27 是进程泄漏，坑 28~29 是测试自身的坑（`setsid` 让 terminate 失效、sway JSON 的 null），坑 30~34 是 1.5.0 审计加固（snprintf 越界、-s 占端口、剪贴板竞争/超时、客户端帧长误判、bash 参数解析），坑 35 是裸二进制串流真实桌面的隔离脚枪，坑 36 是 readdir 无序误拿 .lock 当 socket，坑 37~38 是 IME(v2)/音频的评估结论，坑 39 是默认实例不写 `desktop.sh` 后 sway 的归属证据，坑 40 是多线程进程里 fork 后 setenv/malloc，坑 41 是 keydown 里 preventDefault 吞掉 paste 事件。
 
 ### 坑 1：键盘键码**绝对不能 +8**
 
@@ -314,6 +314,11 @@ if (g_mods) zwp_virtual_keyboard_v1_modifiers(...);   /* ❌ 归零时不发 */
 `Ctrl+V` 在终端里是「引号转义」的意思，不会粘贴。GUI 程序（浏览器/编辑器）
 才是 Ctrl+V。`clients/wstream_client.py` 的 `paste()` 默认用 `ctrl+shift+v`，
 往 GUI 程序里贴要显式传 `keys="ctrl+v"`。
+
+**前端也要区分**（v0.10.1 修）：页面原先一律发 Ctrl+V，中文粘贴到默认的
+`AgentTop` 终端会静默失败。现在按 `/windows` 的 `focused` 字段判断焦点窗口，
+认得出终端就发 Ctrl+Shift+V。**不能「先发 Ctrl+V 再补 Ctrl+Shift+V」**——
+终端里单独的 Ctrl+V 会进入 readline 引号插入状态，后续组合键会被当字面文本插入。
 
 ### 坑 20：`/windows` 不能用 `zwlr_foreign_toplevel_management`
 
@@ -594,6 +599,22 @@ root 下的 `.pid` 文件，或 cmdline 里出现 `<root>/`。默认实例原先
   `launch_thread` 慢慢做。
 - **必须 `POSIX_SPAWN_SETSID`**，否则窗口进程挂在 wstream 的会话下，
   wstream 退出时容易连带出问题；而且它得自己成组才好按归属清理。
+
+---
+
+### 坑 41：`keydown` 里对 Ctrl+V `preventDefault` 会吞掉 `paste` 事件
+
+浏览器只在 keydown **没有被取消**时才派发 `paste`。前端隐藏输入框的 keydown
+里写了 `if(ctrl+V){e.preventDefault();return;}`（本意是「别重复发送，交给 paste
+处理器」），结果 paste 事件根本不发生，粘贴功能整体失效 —— 而且日志、控制台
+都没有任何报错，看起来就像「剪贴板坏了」。
+
+正确做法：keydown 里只 `return`（不 preventDefault），真正阻止文本插进输入框
+由 `paste` 处理器里的 `preventDefault` 负责。
+
+**怎么测出来**：在页面里同时挂 keydown 和 paste 两个探针，对比「接管」与
+「释放」两种状态。释放时 keydown 提前 return、不取消默认行为，paste 正常触发 ——
+这个 A/B 对照 30 秒就能定位，比读代码猜快得多。
 
 ---
 

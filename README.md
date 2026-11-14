@@ -366,11 +366,18 @@ IME 组合期间（`compositionstart` 之后）的按键会被忽略，否则拼
 
 前端行为：
 - 每 2 秒自动同步一次，状态栏显示预览
-- 粘贴时**含非 ASCII 走剪贴板**（写进沙箱剪贴板再发 Ctrl+V），纯 ASCII 仍逐键打
+- 粘贴时**含非 ASCII 走剪贴板**，纯 ASCII 仍逐键打
+- 走剪贴板时按**焦点窗口**选组合键：终端发 `Ctrl+Shift+V`，GUI 发 `Ctrl+V`
+  （终端里 `Ctrl+V` 是引号转义，见坑 19）。焦点来自 `/windows` 的 `focused` 字段
 - `Ctrl+Shift+V` 把沙箱剪贴板复制到你自己的电脑
 
 > **为什么粘贴要绕剪贴板**：逐键注入的中文到不了 XWayland（keycode 9 冲突）。
-> 走剪贴板 + Ctrl+V 则所有程序都能收到。实测 X11 客户端收到 `CLIP 中文通过剪贴板`。
+> 走剪贴板粘贴则所有程序都能收到。实测 X11 客户端收到 `CLIP 中文通过剪贴板`。
+
+> ⚠️ **`keydown` 里的 Ctrl+V 绝不能 `preventDefault`**：取消 keydown 的默认行为
+> 会让浏览器**根本不派发 `paste` 事件**，粘贴处理器永远不执行 —— 现象就是
+> 「剪贴板功能不能用」，日志里还什么都看不到。要阻止文本插进隐藏输入框，
+> 由 `paste` 处理器自己 `preventDefault`。
 
 剪贴板帧**不受输入所有权限制**（围观者也能复制），数据上限 256KB。
 
@@ -564,7 +571,12 @@ keymap」加了每键推送，把组合键全弄坏了 —— 而且 24 项测�
 
 ### 19. 终端里粘贴是 `Ctrl+Shift+V`
 
-`Ctrl+V` 在终端里是「引号转义」。GUI 程序才是 `Ctrl+V`。
+`Ctrl+V` 在终端里是「引号转义」。GUI 程序才是 `Ctrl+V`。页面因此按焦点窗口
+（`/windows` 的 `focused`）区分：认得出终端就发 `Ctrl+Shift+V`。
+沙箱默认窗口就是终端，所以这不是边角情况。
+
+⚠️ 不能「先发 Ctrl+V 再补 Ctrl+Shift+V」：终端里单独的 `Ctrl+V` 会进入
+readline 的引号插入状态，接着那串组合键会被当成字面文本插进去。
 
 ### 20. `/windows` 不能用 foreign-toplevel 协议
 

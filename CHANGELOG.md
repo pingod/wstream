@@ -2,6 +2,27 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.10.1] - 2026-11-14
+
+### 修复
+
+- **浏览器里的粘贴完全不能用**：隐藏输入框的 `keydown` 里对 `Ctrl+V` 调了
+  `preventDefault()`，浏览器因此**不再派发 `paste` 事件**，粘贴处理器永远不执行。
+  改成只 `return`，阻止文本插入输入框交给 `paste` 处理器自己做。
+- **中文粘贴到终端静默失败**：非 ASCII 走「写剪贴板 + 发粘贴键」，但页面一律发
+  `Ctrl+V`，而终端里粘贴是 `Ctrl+Shift+V`（`Ctrl+V` 是引号转义）。现在按
+  `/windows` 的 `focused` 字段判断焦点窗口：终端发 `Ctrl+Shift+V`，GUI 发 `Ctrl+V`。
+  必须先问清焦点再发一次 —— 先发 `Ctrl+V` 再补 `Ctrl+Shift+V` 会进入 readline
+  的引号插入状态，组合键被当字面文本插入。
+- `/windows` 增 `focused` 字段（sway 的真实键盘焦点）。
+
+### 测试
+
+- `wstest` 增 3 项前端静态断言：Ctrl+V 分支不得 `preventDefault`、粘贴按终端/GUI
+  区分、`sendPaste` 里确实发 Shift。同时修正 `/notwindows` 断言 —— 它原本检查
+  body 不含 `"windows"`，页面加上 `fetch('/windows')` 后误报，改为检查没有返回
+  `/windows` 的 JSON。
+
 ## [0.10] - 2026-11-14
 
 ### 变更

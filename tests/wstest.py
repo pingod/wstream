@@ -912,9 +912,13 @@ def main():
         check("/info 带版本号", bool(info.get("version")), f"(info={info})")
 
         # 9b. 端点精确匹配：/notwindows 不该命中 /windows（原来 strstr 会误命中）
+        # ⚠️ 不能断言 body 里不含 "windows"：页面 JS 里有 fetch('/windows')，
+        #    那样写会在前端正常演进时误报。真正要验的是「没走 /windows 处理器」，
+        #    即返回的是 HTML 索引页而不是 {"windows":[...]} 那段 JSON。
         st, body = http_body("/notwindows")
-        check("/notwindows 不误命中 /windows", "200" in st and b"windows" not in body,
-              f"(st={st})")
+        check("/notwindows 不误命中 /windows",
+              "200" in st and not body.lstrip().startswith(b'{"windows"'),
+              f"(st={st} body={body[:60]!r})")
         st, body = http_body("/windows")
         check("/windows 正常返回窗口列表", "200" in st and b"windows" in body, f"(st={st})")
         st, _ = http_body("/wsfoo")
@@ -1038,6 +1042,23 @@ def main():
         missing = optvals - keys_in_mods
         check("快捷键修饰键 value 与 MODS 一致", bool(optvals) and not missing,
               f"(options={sorted(optvals)} MODS={sorted(keys_in_mods)} 缺={sorted(missing)})")
+
+        # 9j3. 粘贴链路的两条静态约束（都真出过 bug，且都是「静默失效」型）。
+        #
+        # ① keydown 里的 Ctrl+V 分支**不能** preventDefault：浏览器一旦在 keydown
+        #    取消默认行为，paste 事件就根本不会派发，粘贴处理器永远不执行。
+        #    现象是「剪贴板功能不能用」，日志里什么都看不到。
+        # ② 终端里粘贴是 Ctrl+Shift+V，页面必须按焦点窗口区分，否则中文粘贴
+        #    到默认的 AgentTop 终端会静默失败。
+        m = re.search(r"if\(\(e\.ctrlKey\|\|e\.metaKey\)&&\(e\.key==='v'\|\|e\.key==='V'\)\)([^;]*);", js)
+        pv = m.group(1) if m else "<未找到 Ctrl+V 分支>"
+        check("Ctrl+V 分支不吞 paste 事件", m is not None and "preventDefault" not in pv,
+              f"(分支体={pv.strip()!r})")
+        check("粘贴按终端/GUI 区分 Ctrl+Shift+V",
+              "focusIsTerminal" in js and "sendPaste" in js,
+              "(缺 focusIsTerminal/sendPaste)")
+        check("终端粘贴用 Shift 修饰", bool(re.search(r"function sendPaste\(term\)\{[^}]*send\(4,42,1\)", js)),
+              "(sendPaste 里没发 Shift)")
 
         # 9k. 隔离护栏：裸 wstream 指向真实登录会话必须拒绝（绝不能抓真实桌面）。
         #     两条都在 wl_display_connect 之前 die，不会真连桌面，安全。
