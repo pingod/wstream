@@ -78,6 +78,8 @@ with WStream() as ws:
 **② 终端里粘贴是 `Ctrl+Shift+V`，不是 `Ctrl+V`。**
 `Ctrl+V` 在终端里是「引号转义」。`paste()` 默认用 `ctrl+shift+v`；
 往 GUI 程序（浏览器、编辑器）里贴可以传 `keys="ctrl+v"`。
+浏览器页面已经会自动按 `/windows` 的 `focused` 判断，脚本里没有这个信息，
+所以要自己选 —— 用 `window(app_id=...)` 确认目标再决定。
 
 **③ 中文必须走剪贴板。**
 逐键注入的 Unicode 到不了 XWayland（keycode 9 冲突），所以 `type_any()`
