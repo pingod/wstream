@@ -306,6 +306,24 @@ static int find_wl_socket(const char *root, char *out, size_t cap) {
     return found;
 }
 
+/* 删掉 <root>/run 下所有 wayland-*（socket 与 .lock）。渲染器回退重试前必须清：
+ * 上一次失败的 sway 可能已经建了 socket 文件，find_wl_socket 会命中它，
+ * 于是「重试成功」是假象 —— 实际连的是个没人监听的死文件。 */
+static void unlink_sockets(const char *root) {
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/run", root);
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (strncmp(de->d_name, "wayland-", 8)) continue;
+        char fp[1024];
+        snprintf(fp, sizeof fp, "%s/%s", dir, de->d_name);
+        unlink(fp);
+    }
+    closedir(d);
+}
+
 static int have_prog(const char *name) {
     char *path = getenv("PATH");
     if (!path) return 0;
@@ -395,9 +413,10 @@ static int sandbox_alive(const char *root, const char *wl) {
 
 /* ---------------------------------------------------------------- 起进程 */
 
-static pid_t spawn_sway(const char *root, const char *sway_bin) {
+static pid_t spawn_sway(const char *root, const char *sway_bin,
+                        const char *renderer, const char *logname) {
     char logpath[512], rundir[512], cfgdir[512];
-    snprintf(logpath, sizeof logpath, "%s/sway.log", root);
+    snprintf(logpath, sizeof logpath, "%s/%s", root, logname);
     snprintf(rundir, sizeof rundir, "%s/run", root);
     snprintf(cfgdir, sizeof cfgdir, "%s/cfg", root);
     pid_t pid = fork();
@@ -412,10 +431,12 @@ static pid_t spawn_sway(const char *root, const char *sway_bin) {
         setenv("XDG_RUNTIME_DIR", rundir, 1);
         setenv("XDG_CONFIG_HOME", cfgdir, 1);
         setenv("WLR_BACKENDS", "headless", 1);
-        /* pixman 是纯软件渲染，不导出 zwp_linux_dmabuf_v1；Vulkan/EGL 客户端（gpui、
-         * 游戏、视频播放器）因此无法创建 surface，会直接失败。用 gles2 走 EGL，
-         * headless 后端可用 GPU 或 llvmpipe；WSTREAM_RENDERER 可覆盖。 */
-        setenv("WLR_RENDERER", getenv("WSTREAM_RENDERER") ? getenv("WSTREAM_RENDERER") : "gles2", 1);
+        /* 渲染器由调用方决定（见 start_instance 的回退逻辑）：
+         *   gles2  —— 走 EGL，会导出 zwp_linux_dmabuf_v1，Vulkan/EGL 客户端（gpui、
+         *             游戏、视频播放器）才能创建 surface。需要 /dev/dri 或可用的
+         *             EGL 设备；裸容器（CI）没有，会报 "no DRM FD available"。
+         *   pixman —— 纯软件，任何环境都能起，但**不导出** dmabuf。 */
+        setenv("WLR_RENDERER", renderer, 1);
         setenv("WLR_HEADLESS_OUTPUTS", "1", 1);
         setenv("__EGL_VENDOR_LIBRARY_FILENAMES",
                "/usr/share/glvnd/egl_vendor.d/50_mesa.json", 1);
@@ -569,23 +590,55 @@ static int start_instance(const char *root, int port, const char *size, const ch
         }
 
         ilog("启动无头沙箱 %s …", size);
-        pid_t spid = spawn_sway(root, sway_bin);
-        if (spid < 0) idie("fork sway 失败: %s", strerror(errno));
-        snprintf(path, sizeof path, "%s/sway.pid", root);
-        write_pid(path, spid);
+        /* 渲染器选择：默认 gles2（导出 dmabuf，Vulkan/EGL 客户端才能起），
+         * 起不来就回退 pixman（纯软件，任何环境都能跑）。裸容器（CI）没有
+         * /dev/dri，gles2 会报 "no DRM FD available" 直接退出 —— 以前这种环境
+         * 只有 pixman 能过，所以回退是必需的，不是可选项。
+         * WSTREAM_RENDERER 可强制指定，此时不回退（用户明确要求）。 */
+        const char *forced = getenv("WSTREAM_RENDERER");
+        const char *cands[2];
+        int ncand = 0;
+        if (forced && *forced) {
+            cands[ncand++] = forced;
+        } else {
+            cands[ncand++] = "gles2";
+            cands[ncand++] = "pixman";
+        }
+        pid_t spid = -1;
+        int chosen = -1;
+        for (int ci = 0; ci < ncand; ci++) {
+            /* 每次尝试都要清掉上次的残留 socket，否则 find_wl_socket 会命中
+             * 上一次（已死）留下的文件，误判成「起来了」。 */
+            unlink_sockets(root);
+            spid = spawn_sway(root, sway_bin, cands[ci],
+                              ci == 0 ? "sway.log" : "sway-fallback.log");
+            if (spid < 0) idie("fork sway 失败: %s", strerror(errno));
+            snprintf(path, sizeof path, "%s/sway.pid", root);
+            write_pid(path, spid);
 
-        /* 等 socket（最多 60 秒；容器首次 fontconfig 建缓存可能很慢） */
-        uint32_t dl = ims() + 60000;
-        while (ims() < dl) {
-            if (find_wl_socket(root, wl, sizeof wl) == 0) break;
-            if (!pid_alive(spid)) break;
-            msleep(250);
+            /* 等 socket（最多 60 秒；容器首次 fontconfig 建缓存可能很慢） */
+            uint32_t dl = ims() + 60000;
+            while (ims() < dl) {
+                if (find_wl_socket(root, wl, sizeof wl) == 0) break;
+                if (!pid_alive(spid)) break;
+                msleep(250);
+            }
+            if (find_wl_socket(root, wl, sizeof wl) == 0) { chosen = ci; break; }
+            if (ci + 1 < ncand) {
+                iwarn("渲染器 %s 起不来，回退 %s 重试", cands[ci], cands[ci + 1]);
+                kill(spid, SIGKILL);
+                msleep(300);
+                unlink_sockets(root);
+            }
         }
         if (find_wl_socket(root, wl, sizeof wl) < 0) {
             snprintf(path, sizeof path, "%s/sway.log", root);
             dump_log_tail(path);
+            snprintf(path, sizeof path, "%s/sway-fallback.log", root);
+            dump_log_tail(path);
             idie("sway 没起来（日志见上）");
         }
+        ilog("沙箱渲染器：%s", cands[chosen < 0 ? 0 : chosen]);
         snprintf(path, sizeof path, "%s/wl_name", root);
         write_file(path, wl, strlen(wl), 0644);
 

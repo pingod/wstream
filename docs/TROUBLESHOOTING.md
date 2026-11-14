@@ -391,11 +391,17 @@ XDG_RUNTIME_DIR=$ROOT/run WAYLAND_DISPLAY=$WL wayland-info | grep dmabuf
 ```
 
 **修复**：用 `gles2` 渲染器（headless 后端走 EGL，GPU 或 llvmpipe 都行）。
-`1.5.1` 起默认已改为 `gles2`，可用 `WSTREAM_RENDERER` 覆盖：
+默认就是 `gles2`；`WSTREAM_RENDERER` 可强制指定（强制后**不回退**）：
 
 ```bash
 WSTREAM_RENDERER=gles2 ./wstream start
 ```
+
+⚠️ **裸容器（没有 `/dev/dri`）里 gles2 起不来**：sway 报
+`Cannot create GLES2 renderer: no DRM FD available` 直接退出。所以
+`wstream start` 会自动回退 —— 先试 gles2，起不来再试 pixman，并在
+`[wstream] 渲染器 gles2 起不来，回退 pixman 重试` 里说明。回退后 dmabuf 就没了，
+Vulkan/EGL 客户端会回到本节开头那个症状，这是环境限制而非配置错误。
 
 修复后 `wayland-info` 应能看到：
 

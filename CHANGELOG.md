@@ -21,6 +21,10 @@
   来自 `desktop.sh`。不再自动写 `desktop.sh` 后它消失了，目录一删就留下孤儿
   `sway-nocap`（lifecycle 第 4 节抓到）。现在 sway 显式带
   `-c <root>/cfg/sway/config`，证据不再依赖窗口脚本。
+- **裸容器里 gles2 渲染器让沙箱起不来**（CI 冒烟测试变红）：sway 报
+  `Cannot create GLES2 renderer: no DRM FD available` 直接退出，因为容器没有
+  `/dev/dri`。现在 `wstream start` 先试 gles2、失败自动回退 pixman 重试
+  （`WSTREAM_RENDERER` 显式指定时不回退），并打印实际选用的渲染器。
 
 ### 测试
 
